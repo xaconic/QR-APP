@@ -54,7 +54,8 @@ export default function AppButton({ title, icon, theme, onPress, disabled = fals
 const styles = StyleSheet.create({
   buttonOuter: {
     width: '100%',
-    marginBottom: 14,
+    marginTop: 18,
+    marginBottom: 2,
   },
   primaryButton: {
     borderRadius: 10,

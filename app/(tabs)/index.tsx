@@ -48,7 +48,7 @@ const styles = StyleSheet.create({
   },
   headerContainer: {
     justifyContent: 'center',
-    paddingTop: 12,
+    paddingTop: 90,
   },
   bodyContainer: {
     paddingHorizontal: 24,
@@ -69,6 +69,6 @@ const styles = StyleSheet.create({
     marginTop: 'auto',
     paddingHorizontal: 24,
     width: '100%',
-    paddingBottom: 16,
+    paddingBottom: 60,
   },
 });

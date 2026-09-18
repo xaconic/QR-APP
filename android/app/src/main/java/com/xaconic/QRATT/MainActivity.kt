@@ -1,4 +1,4 @@
-package com.vanzu.QRATT
+package com.xaconic.QRATT
 import expo.modules.splashscreen.SplashScreenManager
 
 import android.os.Build

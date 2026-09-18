@@ -11,7 +11,7 @@ import {
   TouchableWithoutFeedback,
   Keyboard,
 } from 'react-native';
-import { Link, useRouter } from 'expo-router';
+import { Link, useLocalSearchParams, useRouter } from 'expo-router';
 import { useSafeAreaInsets } from 'react-native-safe-area-context';
 
 import AppButton from '@/components/AppButton';
@@ -22,6 +22,7 @@ import { signIn } from '@/lib/auth';
 export default function LoginScreen() {
   const insets = useSafeAreaInsets();
   const router = useRouter();
+  const params = useLocalSearchParams<{ signupSuccess?: string }>();
   const [email, setEmail] = useState('');
   const [password, setPassword] = useState('');
   const [error, setError] = useState<string | null>(null);
@@ -65,6 +66,10 @@ export default function LoginScreen() {
 
             <Text style={styles.title}>Welcome Back</Text>
             <Text style={styles.subtitle}>Sign in to record your attendance</Text>
+
+            {params.signupSuccess ? (
+              <Text style={styles.successMessage}>{params.signupSuccess}</Text>
+            ) : null}
 
             <View style={styles.form}>
               <Text style={styles.label}>Email</Text>
@@ -143,7 +148,14 @@ const styles = StyleSheet.create({
     fontSize: 14,
     color: COLORS.textSecondary,
     textAlign: 'center',
-    marginBottom: 32,
+    marginBottom: 18,
+  },
+  successMessage: {
+    fontSize: 14,
+    color: '#7ae7a4',
+    textAlign: 'center',
+    marginBottom: 18,
+    fontWeight: '600',
   },
   form: {
     marginBottom: 24,

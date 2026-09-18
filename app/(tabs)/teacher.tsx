@@ -14,6 +14,7 @@ import {
   TextInput,
   View,
 } from 'react-native';
+import { useSafeAreaInsets } from 'react-native-safe-area-context';
 import QRCode from 'react-native-qrcode-svg';
 
 import AppButton from '@/components/AppButton';
@@ -49,6 +50,7 @@ type EditTarget = 'start' | 'end';
 
 export default function TeacherScreen() {
   const { user } = useAuth();
+  const insets = useSafeAreaInsets();
   const [title, setTitle] = useState('');
   const [eventId, setEventId] = useState('');
   const [startDate, setStartDate] = useState(() => new Date());
@@ -171,7 +173,7 @@ export default function TeacherScreen() {
 
     createEvent(event).then(({ error }) => {
       if (error) {
-        setMessage('Could not save the event. Please try again.');
+        setMessage(`Could not save the event: ${error}`);
         return;
       }
 
@@ -183,7 +185,7 @@ export default function TeacherScreen() {
   return (
     <ScrollView
       style={styles.container}
-      contentContainerStyle={styles.content}
+      contentContainerStyle={[styles.content, { paddingTop: 24 + insets.top }]}
       keyboardShouldPersistTaps="handled"
     >
       <Text style={styles.title}>Create Event QR</Text>

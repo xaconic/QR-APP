@@ -1,6 +1,7 @@
 import { useFocusEffect } from 'expo-router';
 import { useCallback, useState } from 'react';
 import { FlatList, StyleSheet, Text, View } from 'react-native';
+import { useSafeAreaInsets } from 'react-native-safe-area-context';
 
 import { COLORS } from '@/constants/colors';
 import { useAuth } from '@/lib/auth';
@@ -14,6 +15,7 @@ import {
 
 export default function HistoryScreen() {
   const { user } = useAuth();
+  const insets = useSafeAreaInsets();
   const [records, setRecords] = useState<AttendanceRecord[]>([]);
   const [teacherSummaries, setTeacherSummaries] = useState<TeacherEventSummary[]>([]);
   const [role, setRole] = useState<'student' | 'teacher'>('student');
@@ -51,7 +53,7 @@ export default function HistoryScreen() {
 
   if (role === 'teacher') {
     return (
-      <View style={styles.container}>
+      <View style={[styles.container, { paddingTop: 24 + insets.top }]}>
         <Text style={styles.title}>Teacher Attendance</Text>
 
         {loading ? (
@@ -82,7 +84,7 @@ export default function HistoryScreen() {
   }
 
   return (
-    <View style={styles.container}>
+    <View style={[styles.container, { paddingTop: 24 + insets.top }]}>
       <Text style={styles.title}>Attendance History</Text>
 
       {loading ? (

@@ -87,9 +87,9 @@ android {
     buildToolsVersion rootProject.ext.buildToolsVersion
     compileSdk rootProject.ext.compileSdkVersion
 
-    namespace 'com.vanzu.QRATT'
+    namespace 'com.xaconic.QRATT'
     defaultConfig {
-        applicationId 'com.vanzu.QRATT'
+        applicationId 'com.xaconic.QRATT'
         minSdkVersion rootProject.ext.minSdkVersion
         targetSdkVersion rootProject.ext.targetSdkVersion
         versionCode 1

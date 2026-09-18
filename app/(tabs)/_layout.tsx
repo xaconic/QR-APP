@@ -5,6 +5,7 @@ export default function TabLayout() {
   return (
     <Tabs
       screenOptions={{
+        headerShown: false,
         tabBarActiveTintColor: '#ffd33d',
         headerStyle: { backgroundColor: '#25292e' },
         headerShadowVisible: false,
@@ -65,7 +66,7 @@ export default function TabLayout() {
         }}
       />
 
-              <Tabs.Screen
+      <Tabs.Screen
       name="teacher"
       options={{
         title: 'Teacher',

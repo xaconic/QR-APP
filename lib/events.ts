@@ -17,6 +17,14 @@ export type CloudEvent = {
   created_at: string;
 };
 
+function sanitizeEventText(value: string, maxLength = 120) {
+  return value
+    .replace(/\\/g, '')
+    .replace(/[\u0000-\u001F\u007F]/g, '')
+    .trim()
+    .slice(0, maxLength);
+}
+
 export async function createEvent(
   event: Event
 ): Promise<{ error: string | null }> {
@@ -24,13 +32,25 @@ export async function createEvent(
     data: { user },
   } = await supabase.auth.getUser();
 
+  if (!user?.id) {
+    return { error: 'You must be signed in to create an event.' };
+  }
+
+  const safeEventId = sanitizeEventText(event.eventId, 40)
+    .replace(/[^A-Za-z0-9_-]/g, '');
+  const safeTitle = sanitizeEventText(event.title, 120);
+
+  if (!safeEventId || !safeTitle) {
+    return { error: 'Event title and code are required.' };
+  }
+
   const { error } = await supabase.from('events').upsert(
     {
-      event_code: event.eventId,
-      title: event.title,
+      event_code: safeEventId,
+      title: safeTitle,
       start_time: event.start || null,
       end_time: event.end || null,
-      created_by: user?.id ?? null,
+      created_by: user.id,
     },
     { onConflict: 'event_code' }
   );

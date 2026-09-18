@@ -12,7 +12,7 @@ import {
   Keyboard,
   Pressable,
 } from 'react-native';
-import { Link } from 'expo-router';
+import { Link, useRouter } from 'expo-router';
 import { useSafeAreaInsets } from 'react-native-safe-area-context';
 
 import AppButton from '@/components/AppButton';
@@ -22,6 +22,7 @@ import { signUp } from '@/lib/auth';
 
 export default function RegisterScreen() {
   const insets = useSafeAreaInsets();
+  const router = useRouter();
   const [email, setEmail] = useState('');
   const [password, setPassword] = useState('');
   const [confirmPassword, setConfirmPassword] = useState('');
@@ -60,8 +61,10 @@ export default function RegisterScreen() {
       if (authError) {
         setError(authError.message);
       } else if (data.session) {
-        // Email confirmation is disabled in this project, so login happens immediately
-        setSuccess(false);
+        router.replace({
+          pathname: '/login',
+          params: { signupSuccess: 'Account created successfully. Please sign in.' },
+        });
       } else {
         setSuccess(true);
       }
