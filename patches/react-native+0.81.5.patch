@@ -1,0 +1,23 @@
+diff --git a/node_modules/react-native/ReactAndroid/cmake-utils/ReactNative-application.cmake b/node_modules/react-native/ReactAndroid/cmake-utils/ReactNative-application.cmake
+--- a/node_modules/react-native/ReactAndroid/cmake-utils/ReactNative-application.cmake
++++ b/node_modules/react-native/ReactAndroid/cmake-utils/ReactNative-application.cmake
+@@ -77,4 +77,5 @@ target_link_libraries(${CMAKE_PROJECT_NAME}
+         fbjni                               # via 3rd party prefab
+         jsi                                 # prefab ready
+         reactnative                         # prefab ready
++        c++_shared
+ )
+@@ -95,6 +96,6 @@ if(EXISTS ${PROJECT_BUILD_DIR}/generated/autolinking/src/main/jni/Android-autoli
+         include(${PROJECT_BUILD_DIR}/generated/autolinking/src/main/jni/Android-autolinking.cmake)
+         target_link_libraries(${CMAKE_PROJECT_NAME} ${AUTOLINKED_LIBRARIES})
+         foreach(autolinked_library ${AUTOLINKED_LIBRARIES})
+-            target_link_libraries(${autolinked_library} common_flags)
++            target_link_libraries(${autolinked_library} common_flags c++_shared)
+         endforeach()
+ endif()
+@@ -103,4 +104,4 @@ if(EXISTS ${PROJECT_BUILD_DIR}/generated/source/codegen/jni/CMakeLists.txt)
+         add_subdirectory(${PROJECT_BUILD_DIR}/generated/source/codegen/jni/ codegen_app_build)
+         get_property(APP_CODEGEN_TARGET DIRECTORY ${PROJECT_BUILD_DIR}/generated/source/codegen/jni/ PROPERTY BUILDSYSTEM_TARGETS)
+         target_link_libraries(${CMAKE_PROJECT_NAME} ${APP_CODEGEN_TARGET})
+-        target_link_libraries(${APP_CODEGEN_TARGET} common_flags)
++        target_link_libraries(${APP_CODEGEN_TARGET} common_flags c++_shared)

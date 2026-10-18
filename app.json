@@ -1,26 +1,33 @@
 {
   "expo": {
-    "name": "QR-ATT",
+    "name": "Acadence",
     "slug": "QR-ATT",
     "version": "1.0.0",
     "orientation": "portrait",
-    "icon": "./assets/images/jip.png",
+    "icon": "./assets/images/android-icon-monochrome.png",
     "scheme": "qr-attendance",
-    "userInterfaceStyle": "light",
+    "userInterfaceStyle": "dark",
     "newArchEnabled": true,
     "ios": {
       "supportsTablet": true
     },
     "android": {
+      "blockedPermissions": [
+        "android.permission.RECORD_AUDIO"
+      ],
       "adaptiveIcon": {
-        "backgroundColor": "#E6F4FE",
+        "backgroundColor": "#07142B",
         "foregroundImage": "./assets/images/android-icon-foreground.png",
-        "backgroundImage": "./assets/images/android-icon-background.png",
         "monochromeImage": "./assets/images/android-icon-monochrome.png"
       },
       "edgeToEdgeEnabled": true,
       "predictiveBackGestureEnabled": false,
       "package": "com.xaconic.QRATT"
+    },
+    "androidNavigationBar": {
+      "backgroundColor": "#07142B",
+      "barStyle": "light-content",
+      "enforceContrast": false
     },
     "web": {
       "output": "static",
@@ -29,15 +36,22 @@
     "plugins": [
       "expo-router",
       [
-        "expo-splash-screen",
+        "expo-media-library",
         {
-          "image": "./assets/images/jip.png",
-          "imageWidth": 200,
-          "resizeMode": "contain",
-          "backgroundColor": "#0f172a"
+          "photosPermission": "Allow Acadence to save event QR codes to your photo library.",
+          "savePhotosPermission": "Allow Acadence to save event QR codes to your photo library.",
+          "granularPermissions": ["photo"]
         }
       ],
-      "expo-sqlite",
+      [
+        "expo-splash-screen",
+        {
+          "image": "./assets/images/splash-branding.png",
+          "imageWidth": 150,
+          "resizeMode": "contain",
+          "backgroundColor": "#07142B"
+        }
+      ],
       "@react-native-community/datetimepicker",
       "expo-secure-store"
     ],

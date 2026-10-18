@@ -23,15 +23,11 @@ plugins {
 }
 
 extensions.configure(com.facebook.react.ReactSettingsExtension) { ex ->
-  if (System.getenv('EXPO_USE_COMMUNITY_AUTOLINKING') == '1') {
-    ex.autolinkLibrariesFromCommand()
-  } else {
-    ex.autolinkLibrariesFromCommand(expoAutolinking.rnConfigCommand)
-  }
+  ex.autolinkLibrariesFromCommand(expoAutolinking.rnConfigCommand)
 }
 expoAutolinking.useExpoModules()
 
-rootProject.name = 'QR-ATT'
+rootProject.name = 'Acadence'
 
 expoAutolinking.useExpoVersionCatalog()
 

@@ -1,77 +1,87 @@
 import Ionicons from '@expo/vector-icons/Ionicons';
-import { Pressable, StyleSheet, Text, View } from 'react-native';
+import { ActivityIndicator, StyleSheet, Text, View } from 'react-native';
 
-import { COLORS } from '@/constants/colors';
+import { COLORS, RADII } from '@/constants/colors';
+import { FONTS } from '@/constants/fonts';
+import { MOTION } from '@/constants/motion';
+import MotionPressable from '@/components/MotionPressable';
 
 type Props = {
   title: string;
   icon: keyof typeof Ionicons.glyphMap;
-  theme?: 'primary';
+  theme?: 'primary' | 'card';
   onPress: () => void;
   disabled?: boolean;
+  compact?: boolean;
+  loading?: boolean;
+  loadingTitle?: string;
 };
 
-export default function AppButton({ title, icon, theme, onPress, disabled = false }: Props) {
-  if (theme === 'primary') {
-    return (
-      <View style={styles.buttonOuter}>
-        <Pressable
-          style={[styles.primaryButton, disabled && styles.disabled]}
-          onPress={onPress}
-          disabled={disabled}
-        >
-          <Ionicons
-            name={icon}
-            size={22}
-            color={COLORS.textOnPrimary}
-            style={styles.icon}
-          />
-          <Text style={styles.primaryLabel}>{title}</Text>
-        </Pressable>
-      </View>
-    );
-  }
-
+export default function AppButton({ title, icon, theme, onPress, disabled = false, compact = false, loading = false, loadingTitle = 'Loading...' }: Props) {
+  const isDisabled = disabled || loading;
+  const primary = theme === 'primary';
+  const card = theme === 'card';
+  const iconColor = primary ? COLORS.textOnPrimary : COLORS.textSecondary;
   return (
-    <View style={styles.buttonOuter}>
-      <Pressable
-        style={[styles.secondaryButton, disabled && styles.disabled]}
+    <View style={[styles.buttonOuter, compact && styles.buttonOuterCompact]}>
+      <MotionPressable
+        pressScale={compact ? MOTION.compactScale : MOTION.buttonScale}
+        style={({ pressed }) => [
+          primary ? styles.primaryButton : card ? styles.cardButton : styles.secondaryButton,
+          compact && styles.compactButton,
+          pressed && styles.pressed,
+          isDisabled && styles.disabled,
+        ]}
         onPress={onPress}
-        disabled={disabled}
+        disabled={isDisabled}
+        accessibilityRole="button"
+        accessibilityState={{ disabled: isDisabled, busy: loading }}
+        android_ripple={{ color: primary ? `${COLORS.textOnPrimary}33` : `${COLORS.primary}22` }}
       >
-        <Ionicons
-          name={icon}
-          size={22}
-          color={COLORS.textSecondary}
-          style={styles.icon}
-        />
-        <Text style={styles.secondaryLabel}>{title}</Text>
-      </Pressable>
+        {loading
+          ? <ActivityIndicator size="small" color={iconColor} style={styles.icon} />
+          : <Ionicons name={icon} size={compact ? 18 : 21} color={iconColor} style={styles.icon} />}
+        <Text style={[primary ? styles.primaryLabel : styles.secondaryLabel, compact && styles.compactLabel]}>
+          {loading ? loadingTitle : title}
+        </Text>
+      </MotionPressable>
     </View>
   );
 }
 
 const styles = StyleSheet.create({
-  buttonOuter: {
-    width: '100%',
-    marginTop: 18,
-    marginBottom: 2,
-  },
+  buttonOuter: { width: '100%', marginTop: 12, marginBottom: 2 },
+  buttonOuterCompact: { marginTop: 3, marginBottom: 0 },
+  compactButton: { minHeight: 40, paddingVertical: 8, paddingHorizontal: 12, borderRadius: RADII.sm },
   primaryButton: {
-    borderRadius: 10,
-    paddingVertical: 15,
-    paddingHorizontal: 20,
+    minHeight: 48,
+    borderRadius: RADII.sm,
+    paddingVertical: 12,
+    paddingHorizontal: 16,
     alignItems: 'center',
     justifyContent: 'center',
     flexDirection: 'row',
-    backgroundColor: COLORS.primary,
+    backgroundColor: COLORS.primaryButtonStart,
     borderWidth: 1,
-    borderColor: COLORS.primary,
+    borderColor: COLORS.primaryButtonStart,
   },
   secondaryButton: {
-    borderRadius: 10,
-    paddingVertical: 15,
-    paddingHorizontal: 20,
+    minHeight: 48,
+    borderRadius: RADII.sm,
+    paddingVertical: 12,
+    paddingHorizontal: 16,
+    alignItems: 'center',
+    justifyContent: 'center',
+    flexDirection: 'row',
+    backgroundColor: COLORS.surface,
+    borderWidth: 1,
+    borderColor: COLORS.border,
+  },
+  cardButton: {
+    minHeight: 48,
+    borderRadius: RADII.sm,
+    paddingVertical: 12,
+    paddingHorizontal: 16,
     alignItems: 'center',
     justifyContent: 'center',
     flexDirection: 'row',
@@ -79,8 +89,10 @@ const styles = StyleSheet.create({
     borderWidth: 1,
     borderColor: COLORS.border,
   },
-  icon: { paddingRight: 10 },
-  primaryLabel: { fontSize: 17, fontWeight: '700', color: COLORS.textOnPrimary },
-  secondaryLabel: { fontSize: 17, fontWeight: '600', color: COLORS.textPrimary },
+  icon: { paddingRight: 8 },
+  primaryLabel: { fontSize: 15, fontWeight: '600', fontFamily: FONTS.semiBold, color: COLORS.textOnPrimary },
+  secondaryLabel: { fontSize: 15, fontWeight: '600', fontFamily: FONTS.semiBold, color: COLORS.textPrimary },
+  compactLabel: { fontSize: 14 },
+  pressed: { opacity: 0.9 },
   disabled: { opacity: 0.5 },
 });

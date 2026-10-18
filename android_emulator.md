@@ -252,4 +252,4 @@ Those are **troubleshooting commands**, mainly for when the emulator/ADB gets st
 
 **Set Android variables → start emulator → verify `device` → start Expo.**
 
-That's the workflow I recommend for your QR Attendance app.
+That's the workflow I recommend for Acadence, your Smart Attendance System.

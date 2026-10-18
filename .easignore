@@ -1,0 +1,28 @@
+node_modules/
+.expo/
+dist/
+web-build/
+expo-env.d.ts
+
+# native
+*.orig.*
+*.jks
+*.p8
+*.p12
+*.key
+*.mobileprovision
+android/local.properties
+android/.gradle/
+android/build/
+android/app/build/
+
+# macOS
+.DS_Store
+
+# local env files
+.env
+.env*.local
+url and api key.txt
+
+# teaching materials
+docs/
