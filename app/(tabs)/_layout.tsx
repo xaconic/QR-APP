@@ -5,6 +5,7 @@ import { StyleSheet, View } from 'react-native';
 import { useSafeAreaInsets } from 'react-native-safe-area-context';
 import MotionPressable from '@/components/MotionPressable';
 import { useAuth } from '@/lib/auth';
+import { subscribeToSupabaseRealtime } from '@/lib/supabaseRealtime';
 import { getProfileWithError, type Role } from '@/lib/profiles';
 import { COLORS } from '@/constants/colors';
 import { FONTS } from '@/constants/fonts';
@@ -16,6 +17,11 @@ export default function TabLayout() {
     const createSelected = pathname.includes('create-event');
     const [role, setRole] = useState<Role | null>(null);
     const canCreateEvent = role === 'teacher' || role === 'admin';
+
+    useEffect(() => {
+      if (!session?.access_token) return;
+      return subscribeToSupabaseRealtime(session.access_token);
+    }, [session?.access_token]);
 
     useEffect(() => {
       setRole(null);

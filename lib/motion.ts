@@ -1,9 +1,10 @@
-import { LayoutAnimation, Platform } from 'react-native';
+import { LayoutAnimation, Platform, UIManager } from 'react-native';
 
 import { MOTION } from '@/constants/motion';
 
 export function animateLayoutChange(reduceMotion: boolean | null) {
   if (Platform.OS === 'web' || reduceMotion !== false) return;
+  if (Platform.OS === 'android') UIManager.setLayoutAnimationEnabledExperimental?.(true);
 
   LayoutAnimation.configureNext({
     duration: MOTION.accordionDuration,

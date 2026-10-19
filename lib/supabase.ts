@@ -1,5 +1,5 @@
 import { Platform } from 'react-native';
-import { createClient } from '@supabase/supabase-js';
+import { createClient, type Session } from '@supabase/supabase-js';
 import * as SecureStore from 'expo-secure-store';
 
 const REQUEST_TIMEOUT_MS = 15000;
@@ -181,3 +181,49 @@ export const supabase = createClient(supabaseUrl, supabaseAnonKey, {
     detectSessionInUrl: false,
   },
 });
+
+const ACCESS_TOKEN_REFRESH_MARGIN_SECONDS = 60;
+let latestAuthSession: Session | null = null;
+
+export function setLatestAuthSession(session: Session | null) {
+  latestAuthSession = session;
+}
+
+export async function getFreshAccessToken(fallbackSession?: Session | null): Promise<string> {
+  const { data, error } = await supabase.auth.getSession();
+  if (error) throw new Error(`Unable to read the signed-in session: ${error.message}`);
+  const candidates = [fallbackSession, latestAuthSession, data.session]
+    .filter((session): session is Session => session !== null && session !== undefined);
+  const matchingCandidates = fallbackSession
+    ? candidates.filter((candidate) => candidate.user.id === fallbackSession.user.id)
+    : candidates;
+  const availableCandidates = matchingCandidates.length ? matchingCandidates : [fallbackSession].filter(
+    (session): session is Session => session !== null && session !== undefined,
+  );
+  const now = Math.floor(Date.now() / 1000);
+  let session = availableCandidates.find((candidate) =>
+    candidate.expires_at !== undefined
+    && candidate.expires_at > now + ACCESS_TOKEN_REFRESH_MARGIN_SECONDS,
+  ) ?? availableCandidates.sort((left, right) => (right.expires_at ?? 0) - (left.expires_at ?? 0))[0] ?? null;
+  if (!session) throw new Error('Your session has expired. Please sign in again.');
+  if (data.session?.access_token !== session.access_token) {
+    const { data: restored, error: restoreError } = await supabase.auth.setSession({
+      access_token: session.access_token,
+      refresh_token: session.refresh_token,
+    });
+    if (restoreError) throw new Error(`Your session could not be restored. Please sign in again: ${restoreError.message}`);
+    if (!restored.session) throw new Error('Your session has expired. Please sign in again.');
+    session = restored.session;
+    latestAuthSession = session;
+  }
+
+  const expiresSoon = !session.expires_at
+    || session.expires_at <= now + ACCESS_TOKEN_REFRESH_MARGIN_SECONDS;
+  if (!expiresSoon) return session.access_token;
+
+  const { data: refreshed, error: refreshError } = await supabase.auth.refreshSession(session);
+  if (refreshError) throw new Error(`Your session could not be refreshed. Please sign in again: ${refreshError.message}`);
+  if (!refreshed.session) throw new Error('Your session has expired. Please sign in again.');
+  latestAuthSession = refreshed.session;
+  return refreshed.session.access_token;
+}

@@ -5,7 +5,7 @@ import { Redirect } from 'expo-router';
 import { useAuth } from '@/lib/auth';
 import BrandedSplashScreen from '@/components/BrandedSplashScreen';
 
-const AUTH_RESTORE_FALLBACK_MS = 8000;
+const AUTH_RESTORE_FALLBACK_MS = 4000;
 
 export default function Index() {
   const { session, loading } = useAuth();

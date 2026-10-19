@@ -23,10 +23,15 @@ export default function EventEditScreen() {
       if (!user || !eventId) { if (active) setState('Event not found.'); return; }
       const profile = await getProfile(user.id, session?.access_token);
       if (!profile || (profile.role !== 'teacher' && profile.role !== 'admin')) { if (active) setState('You are not authorized to edit events.'); return; }
-      const loaded = await getManagedEventById(eventId);
+      const result = await getManagedEventById(eventId, session);
       if (!active) return;
-      if (!loaded) setState('Event not found.'); else setEvent(loaded);
-    })();
+      if (result.error || !result.data) setState(result.error ?? 'The event was not found or is not available to this account.');
+      else setEvent(result.data);
+    })().catch((error: unknown) => {
+      if (!active) return;
+      console.error('Unable to load event settings.', error);
+      setState(error instanceof Error ? error.message : 'Event settings could not be loaded.');
+    });
     return () => { active = false; };
   }, [eventId, session?.access_token, user]);
 

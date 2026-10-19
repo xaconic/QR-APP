@@ -24,10 +24,17 @@ import { formatCourseLabel, getAcademicSections, getAcademicLevels, getCourses, 
 
 const KeyboardTextInput: any = TextInput;
 
-function getRegistrationErrorMessage(message: string) {
+function getRegistrationErrorMessage(message: string, role: 'student' | 'teacher') {
   const normalized = message.toLowerCase();
+  if (role === 'teacher' && (
+    normalized.includes('student academic information is required')
+    || normalized.includes('teacher_requested_at')
+    || normalized.includes('null value in column "role"')
+  )) {
+    return 'Teacher requests are not enabled in the database yet. Ask an administrator to apply migration 20261061000000_add_teacher_signup_requests.sql.';
+  }
   if (normalized.includes('already registered') || normalized.includes('already exists')) {
-    return 'An account with this email may already exist. Try signing in instead.';
+    return 'This email is already linked to an account. Try signing in, or contact an administrator if it was recently deleted.';
   }
   if (normalized.includes('password')) return 'Choose a password that meets the account requirements.';
   if (normalized.includes('invalid email')) return 'Enter a valid email address.';
@@ -54,6 +61,7 @@ export default function RegisterScreen() {
   const passwordRef = useRef<TextInput>(null);
   const confirmPasswordRef = useRef<TextInput>(null);
   const [fullName, setFullName] = useState('');
+  const [selectedRole, setSelectedRole] = useState<'student' | 'teacher'>('student');
   const [error, setError] = useState<string | null>(null);
   const [success, setSuccess] = useState(false);
   const [emailConfirmationRequired, setEmailConfirmationRequired] = useState(false);
@@ -152,16 +160,18 @@ export default function RegisterScreen() {
       return;
     }
 
-    if (!courseId || !yearLevelId || !sectionId) {
-      setError('Course, year level, and section/block are required for students.');
-      return;
-    }
+    if (selectedRole === 'student') {
+      if (!courseId || !yearLevelId || !sectionId) {
+        setError('Course, year level, and section/block are required for students.');
+        return;
+      }
 
-    const selectedCourse = courses.find((item) => item.id === courseId);
-    const selectedLevel = academicLevels.find((item) => item.id === academicLevelId);
-    if (!academicLevelId || !selectedCourse || selectedCourse.academic_level_id !== academicLevelId || !selectedLevel) {
-      setError('Please select a valid academic level and program.');
-      return;
+      const selectedCourse = courses.find((item) => item.id === courseId);
+      const selectedLevel = academicLevels.find((item) => item.id === academicLevelId);
+      if (!academicLevelId || !selectedCourse || selectedCourse.academic_level_id !== academicLevelId || !selectedLevel) {
+        setError('Please select a valid academic level and program.');
+        return;
+      }
     }
 
     setLoading(true);
@@ -169,14 +179,22 @@ export default function RegisterScreen() {
     try {
       const { data, error: authError } = await signUp(email.trim(), password, {
         full_name: fullName.trim(),
-        course_id: courseId,
-        academic_level_id: academicLevelId,
-        year_level_id: yearLevelId,
-        section_id: sectionId,
+        role: selectedRole,
+        ...(selectedRole === 'student' ? {
+          course_id: courseId!,
+          academic_level_id: academicLevelId!,
+          year_level_id: yearLevelId!,
+          section_id: sectionId!,
+        } : {}),
       });
 
       if (authError) {
-        setError(getRegistrationErrorMessage(authError.message));
+        console.error('Supabase rejected account registration.', {
+          message: authError.message,
+          code: authError.code,
+          status: authError.status,
+        });
+        setError(getRegistrationErrorMessage(authError.message, selectedRole));
       } else {
         setEmailConfirmationRequired(!data.session);
         setSuccess(true);
@@ -184,7 +202,7 @@ export default function RegisterScreen() {
     } catch (err: unknown) {
       console.error('Account registration failed before a Supabase response was received.', err);
       setError(err instanceof Error
-        ? getRegistrationErrorMessage(err.message)
+        ? getRegistrationErrorMessage(err.message, selectedRole)
         : 'An unexpected error occurred. Please try again.');
     } finally {
       setLoading(false);
@@ -232,9 +250,13 @@ export default function RegisterScreen() {
                   {emailConfirmationRequired ? 'Check your email' : 'Account created successfully'}
                 </Text>
                 <Text style={styles.successText}>
-                  {emailConfirmationRequired
-                    ? `If ${email} can be registered, we’ll send a verification link. Verify your email, then return here to sign in.`
-                    : 'Your account is ready. Sign in with your email and password to continue.'}
+                  {selectedRole === 'teacher'
+                    ? emailConfirmationRequired
+                      ? `If ${email} can be registered, we’ll send a verification link. Verify your email; an administrator will review your teacher request.`
+                      : 'Your teacher request has been sent to the administrators. You can sign in as a student while your request is pending.'
+                    : emailConfirmationRequired
+                      ? `If ${email} can be registered, we’ll send a verification link. Verify your email, then return here to sign in.`
+                      : 'Your account is ready. Sign in with your email and password to continue.'}
                 </Text>
                 <MotionPressable
                   style={({ pressed }) => [
@@ -258,11 +280,46 @@ export default function RegisterScreen() {
             ) : (
               <>
               <View style={[styles.intro, compact && styles.introCompact]}>
-                <Text style={styles.eyebrow}>STUDENT PORTAL</Text>
+                <Text style={styles.eyebrow}>{selectedRole.toUpperCase()} PORTAL</Text>
                 <Text style={styles.title}>Create your account</Text>
-                <Text style={styles.subtitle}>Set up your student profile to get started.</Text>
+                <Text style={styles.subtitle}>
+                  {selectedRole === 'student'
+                    ? 'Set up your student profile to get started.'
+                    : 'Submit a teacher account request for administrator approval.'}
+                </Text>
               </View>
               <View style={[styles.form, compact && styles.formCompact]}>
+                <View style={styles.sectionHeading}>
+                  <Text style={styles.sectionTitle}>Account type</Text>
+                  <Text style={styles.sectionNote}>Choose one</Text>
+                </View>
+                <View style={styles.roleRow} accessibilityRole="radiogroup">
+                  {(['student', 'teacher'] as const).map((role) => {
+                    const selected = selectedRole === role;
+                    return (
+                      <MotionPressable
+                        key={role}
+                        style={[styles.roleChip, selected && styles.roleChipActive]}
+                        onPress={() => {
+                          setSelectedRole(role);
+                          setError(null);
+                        }}
+                        disabled={loading}
+                        accessibilityRole="radio"
+                        accessibilityState={{ checked: selected, disabled: loading }}
+                      >
+                        <Text style={[styles.roleChipText, selected && styles.roleChipTextActive]}>
+                          {role === 'student' ? 'Student' : 'Teacher'}
+                        </Text>
+                      </MotionPressable>
+                    );
+                  })}
+                </View>
+                {selectedRole === 'teacher' && (
+                  <Text style={styles.teacherRequestNote}>
+                    Teacher access is not active until an administrator approves your request.
+                  </Text>
+                )}
                 <View style={styles.sectionHeading}>
                   <Text style={styles.sectionTitle}>Your details</Text>
                   <Text style={styles.sectionNote}>All fields are required</Text>
@@ -391,7 +448,7 @@ export default function RegisterScreen() {
                   <Text style={styles.fieldError}>Passwords do not match.</Text>
                 )}
 
-                <View>
+                {selectedRole === 'student' && <View>
                     <Text style={styles.label}>Academic Level</Text>
                     <OptionPicker
                       value={academicLevels.find((item) => item.id === academicLevelId)?.name ?? ''}
@@ -442,9 +499,16 @@ export default function RegisterScreen() {
                       disabled={loading || !yearLevelId}
                       loading={sectionsLoading}
                     />
-                </View>
+                </View>}
 
-                {error && <Text style={styles.error} accessibilityRole="alert">{error}</Text>}
+                {error && (
+                  <View style={styles.errorBanner} accessibilityRole="alert">
+                    <View style={styles.errorIconWrap}>
+                      <Ionicons name="alert-circle" size={18} color={COLORS.danger} />
+                    </View>
+                    <Text style={styles.errorText}>{error}</Text>
+                  </View>
+                )}
 
                 {loading ? (
                   <View style={styles.submitLoading}>
@@ -558,7 +622,12 @@ function OptionPicker({
       ) : (
         <View style={styles.selectShell}>
           <MotionPressable style={[styles.selectValue, unavailable && styles.selectDisabled]} disabled={unavailable} onPress={() => setOpen((current) => !current)}>
-            <Text style={value ? styles.selectText : styles.selectPlaceholder}>{value || placeholder}</Text>
+            <Text style={[
+              value ? styles.selectText : styles.selectPlaceholder,
+              unavailable && styles.selectDisabledText,
+            ]}>
+              {value || placeholder}
+            </Text>
           </MotionPressable>
           {selectedId && (
             <MotionPressable
@@ -674,7 +743,7 @@ const styles = StyleSheet.create({
   },
   catalogNote: { fontSize: 12, color: COLORS.warning, lineHeight: 17, marginBottom: 6 },
   input: {
-    backgroundColor: COLORS.surface,
+    backgroundColor: COLORS.surfaceRaised,
     borderRadius: 11,
     borderWidth: 1,
     borderColor: COLORS.border,
@@ -694,7 +763,7 @@ const styles = StyleSheet.create({
   passwordInput: { paddingRight: 48 },
   passwordToggle: { position: 'absolute', right: 14, padding: 4 },
   selectValue: {
-    backgroundColor: COLORS.surface,
+    backgroundColor: COLORS.surfaceRaised,
     borderRadius: 11,
     borderWidth: 1,
     borderColor: COLORS.border,
@@ -707,12 +776,13 @@ const styles = StyleSheet.create({
   clearButton: { position: 'absolute', right: 14, top: 12, zIndex: 2, padding: 2 },
   dropdownCloseButton: { right: 42 },
   selectLoading: { position: 'absolute', right: 16, top: 13, zIndex: 2 },
-  selectDisabled: { opacity: 0.55 },
+  selectDisabled: { backgroundColor: COLORS.card, borderColor: COLORS.surfaceRaised },
+  selectDisabledText: { color: COLORS.textMuted },
   selectText: { color: COLORS.textPrimary, fontSize: 14, fontFamily: FONTS.regular },
   selectInput: { color: COLORS.textPrimary, fontSize: 14, fontFamily: FONTS.regular },
   selectPlaceholder: { color: COLORS.textMuted, fontSize: 14, fontFamily: FONTS.regular },
   optionRow: { gap: 6, marginTop: 4, padding: 6, borderWidth: 1, borderColor: COLORS.border, borderRadius: 8, backgroundColor: COLORS.card },
-  optionChip: { width: '100%', borderWidth: 1, borderColor: COLORS.border, borderRadius: 10, paddingHorizontal: 12, paddingVertical: 12, backgroundColor: COLORS.surface },
+  optionChip: { width: '100%', borderWidth: 1, borderColor: COLORS.border, borderRadius: 10, paddingHorizontal: 12, paddingVertical: 12, backgroundColor: COLORS.surfaceRaised },
   optionChipActive: { borderColor: COLORS.primary, backgroundColor: `${COLORS.primary}18` },
   optionText: { color: COLORS.textSecondary, fontSize: 14, fontWeight: '600', fontFamily: FONTS.semiBold },
   optionTextActive: { color: COLORS.primary },
@@ -725,7 +795,7 @@ const styles = StyleSheet.create({
   },
   roleChip: {
     flex: 1,
-    backgroundColor: COLORS.card,
+    backgroundColor: COLORS.surfaceRaised,
     borderWidth: 1,
     borderColor: COLORS.border,
     borderRadius: 10,
@@ -733,8 +803,8 @@ const styles = StyleSheet.create({
     alignItems: 'center',
   },
   roleChipActive: {
-    borderColor: COLORS.primary,
-    backgroundColor: `${COLORS.primary}14`,
+    borderColor: COLORS.primaryButtonStart,
+    backgroundColor: COLORS.primaryButtonStart,
   },
   roleChipText: {
     fontSize: 14,
@@ -743,25 +813,48 @@ const styles = StyleSheet.create({
     fontFamily: FONTS.semiBold,
   },
   roleChipTextActive: {
-    color: COLORS.primary,
+    color: COLORS.textOnPrimary,
     fontWeight: '700',
+  },
+  teacherRequestNote: {
+    color: COLORS.textSecondary,
+    fontSize: 12,
+    lineHeight: 18,
+    marginBottom: 14,
   },
   toggleRow: { flexDirection: 'row', flexWrap: 'wrap', gap: 8, marginBottom: 4 },
   toggleButton: { borderWidth: 1, borderColor: COLORS.border, borderRadius: 8, paddingHorizontal: 16, paddingVertical: 11, minHeight: 44, minWidth: 128, alignItems: 'center', backgroundColor: COLORS.surface },
   toggleButtonActive: { borderColor: COLORS.primaryButtonStart, backgroundColor: COLORS.primaryButtonStart },
   toggleText: { color: COLORS.textSecondary, fontSize: 12, fontWeight: '700', fontFamily: FONTS.bold },
   toggleTextActive: { color: COLORS.textOnPrimary },
-  error: {
-    fontSize: 13,
-    color: COLORS.danger,
-    fontFamily: FONTS.medium,
-    textAlign: 'left',
+  errorBanner: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    gap: 10,
     marginTop: 14,
     marginBottom: 6,
-    lineHeight: 19,
-    padding: 11,
-    borderRadius: 10,
-    backgroundColor: `${COLORS.danger}12`,
+    paddingHorizontal: 13,
+    paddingVertical: 12,
+    borderRadius: 12,
+    borderWidth: 1,
+    borderColor: `${COLORS.danger}55`,
+    backgroundColor: `${COLORS.danger}14`,
+  },
+  errorIconWrap: {
+    width: 28,
+    height: 28,
+    alignItems: 'center',
+    justifyContent: 'center',
+    borderRadius: 14,
+    backgroundColor: `${COLORS.danger}20`,
+  },
+  errorText: {
+    flex: 1,
+    fontSize: 13,
+    color: '#FF9A9A',
+    fontFamily: FONTS.medium,
+    textAlign: 'left',
+    lineHeight: 18,
   },
   registrationSubmitGap: {
     height: 8,

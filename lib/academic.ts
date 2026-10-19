@@ -1,5 +1,7 @@
-import { supabase } from './supabase';
+import { getFreshAccessToken, supabase } from './supabase';
+import type { Session } from '@supabase/supabase-js';
 import { normalizeEventAttendanceSummary, type EventAttendanceStudent, type EventAttendanceSummary } from './attendanceSummary';
+import type { CloudEvent } from './events';
 
 export { normalizeEventAttendanceSummary } from './attendanceSummary';
 export type { EventAttendanceStudent, EventAttendanceSummary } from './attendanceSummary';
@@ -35,10 +37,19 @@ export type AttendanceCorrection = {
 
 export async function getEventAttendanceCorrections(
   eventId: string,
+  fallbackSession?: Session | null,
 ): Promise<{ data: AttendanceCorrection[] | null; error: string | null }> {
-  const { data, error } = await supabase.rpc('get_event_attendance_corrections', {
+  let accessToken: string;
+  try {
+    accessToken = await getFreshAccessToken(fallbackSession);
+  } catch (error) {
+    return { data: null, error: error instanceof Error ? error.message : 'Your session could not be refreshed.' };
+  }
+  const request = supabase.rpc('get_event_attendance_corrections', {
     p_event_id: eventId,
   });
+  request.setHeader('Authorization', `Bearer ${accessToken}`);
+  const { data, error } = await request;
   if (error) return { data: null, error: 'Correction history could not be loaded.' };
   if (!Array.isArray(data)) return { data: null, error: 'Correction history returned an invalid response.' };
 
@@ -92,8 +103,15 @@ export async function getEventAttendanceExportPage(
   },
   offset: number,
   limit: number,
+  fallbackSession?: Session | null,
 ): Promise<{ data: AttendanceExportPage | null; error: string | null }> {
-  const { data, error } = await supabase.rpc('get_event_attendance_export', {
+  let accessToken: string;
+  try {
+    accessToken = await getFreshAccessToken(fallbackSession);
+  } catch (error) {
+    return { data: null, error: error instanceof Error ? error.message : 'Your session could not be refreshed.' };
+  }
+  const request = supabase.rpc('get_event_attendance_export', {
     p_event_id: eventId,
     p_offset: offset,
     p_limit: limit,
@@ -105,6 +123,8 @@ export async function getEventAttendanceExportPage(
     p_to_date: null,
     p_search: filters.search?.trim() || null,
   });
+  request.setHeader('Authorization', `Bearer ${accessToken}`);
+  const { data, error } = await request;
 
   if (error) return { data: null, error: error.message };
   if (!data || typeof data !== 'object') {
@@ -178,16 +198,29 @@ export async function getEventAttendanceSummary(
     sectionId?: string;
     status?: string;
     attendanceFinalized?: boolean;
-  } = {}
+  } = {},
+  fallbackSession?: Session | null,
 ): Promise<{ data: EventAttendanceSummary | null; error: string | null }> {
   const { attendanceFinalized = false, ...rpcFilters } = filters;
-  const { data, error } = await supabase.rpc('get_event_attendance_summary', {
+  let accessToken: string;
+  try {
+    accessToken = await getFreshAccessToken(fallbackSession);
+  } catch (error) {
+    return {
+      data: null,
+      error: error instanceof Error ? error.message : 'Your session could not be refreshed.',
+    };
+  }
+
+  const request = supabase.rpc('get_event_attendance_summary', {
     p_event_id: eventId,
     p_course_id: rpcFilters.courseId || null,
     p_year_level_id: rpcFilters.yearLevelId || null,
     p_section_id: rpcFilters.sectionId || null,
     p_status: rpcFilters.status || null,
   });
+  request.setHeader('Authorization', `Bearer ${accessToken}`);
+  const { data, error } = await request;
   if (error) return { data: null, error: error.message };
   const summary = normalizeEventAttendanceSummary(data, attendanceFinalized);
   if (!summary) return { data: null, error: 'The attendance summary returned an invalid response.' };
@@ -195,24 +228,98 @@ export async function getEventAttendanceSummary(
 }
 
 export async function recordEventAttendance(eventId: string, studentId: string, status: NonNullable<EventAttendanceStudent['status']>) {
-  const { error } = await supabase.rpc('record_event_attendance', { p_event_id: eventId, p_student_id: studentId, p_status: status });
-  return { error: error?.message ?? null };
+  try {
+    const accessToken = await getFreshAccessToken();
+    const request = supabase.rpc('record_event_attendance', { p_event_id: eventId, p_student_id: studentId, p_status: status });
+    request.setHeader('Authorization', `Bearer ${accessToken}`);
+    const { error } = await request;
+    return { error: error?.message ?? null };
+  } catch (error) {
+    return { error: error instanceof Error ? error.message : 'Attendance could not be updated.' };
+  }
 }
 
 export async function clearEventAttendance(eventId: string, studentId: string) {
-  const { error } = await supabase.rpc('clear_event_attendance', { p_event_id: eventId, p_student_id: studentId });
-  return { error: error?.message ?? null };
+  try {
+    const accessToken = await getFreshAccessToken();
+    const request = supabase.rpc('clear_event_attendance', { p_event_id: eventId, p_student_id: studentId });
+    request.setHeader('Authorization', `Bearer ${accessToken}`);
+    const { error } = await request;
+    return { error: error?.message ?? null };
+  } catch (error) {
+    return { error: error instanceof Error ? error.message : 'Attendance could not be cleared.' };
+  }
 }
 
-export async function getTeacherAuthorizedEvents(teacherId: string) {
-  const [{ data: owned }, { data: assignments }] = await Promise.all([
-    supabase.from('events').select('*').eq('created_by', teacherId).is('archived_at', null),
-    supabase.from('event_staff').select('event_id').eq('teacher_id', teacherId),
+export async function getTeacherAuthorizedEvents(
+  teacherId: string,
+  fallbackSession?: Session | null,
+): Promise<{ data: CloudEvent[] | null; error: string | null }> {
+  let accessToken: string;
+  try {
+    accessToken = await getFreshAccessToken(fallbackSession);
+  } catch (error) {
+    const message = error instanceof Error ? error.message : 'Your session could not be refreshed.';
+    return { data: null, error: message };
+  }
+  const { data: authData, error: authError } = await supabase.auth.getUser(accessToken);
+  if (authError || authData.user?.id !== teacherId) {
+    return { data: null, error: 'The signed-in account changed. Please sign in again and reload your events.' };
+  }
+
+  const ownedRequest = supabase
+    .from('events')
+    .select('*')
+    .eq('created_by', teacherId)
+    .is('archived_at', null);
+  const assignmentsRequest = supabase
+    .from('event_staff')
+    .select('event_id')
+    .eq('teacher_id', teacherId)
+    .eq('can_manage', true);
+  ownedRequest.setHeader('Authorization', `Bearer ${accessToken}`);
+  assignmentsRequest.setHeader('Authorization', `Bearer ${accessToken}`);
+
+  const [ownedResult, assignmentsResult] = await Promise.all([
+    ownedRequest,
+    assignmentsRequest,
   ]);
-  const ids = Array.from(new Set([...(owned ?? []).map((item: any) => item.id), ...(assignments ?? []).map((item: any) => item.event_id)]));
-  if (!ids.length) return [];
-  const { data } = await supabase.from('events').select('*').in('id', ids).is('archived_at', null).order('start_time', { ascending: true });
-  return data ?? [];
+  const queryError = ownedResult.error ?? assignmentsResult.error;
+  if (queryError) return { data: null, error: queryError.message };
+
+  const owned = (ownedResult.data ?? []) as CloudEvent[];
+  const ownedIds = new Set(owned.map((event) => event.id));
+  const assignedIds = Array.from(new Set(
+    (assignmentsResult.data ?? [])
+      .map((assignment) => assignment.event_id)
+      .filter((eventId) => !ownedIds.has(eventId)),
+  ));
+
+  if (assignedIds.length === 0) {
+    return {
+      data: owned.sort((left, right) =>
+        new Date(right.start_time ?? right.created_at).getTime()
+        - new Date(left.start_time ?? left.created_at).getTime()),
+      error: null,
+    };
+  }
+
+  const assignedRequest = supabase
+    .from('events')
+    .select('*')
+    .in('id', assignedIds)
+    .is('archived_at', null);
+  assignedRequest.setHeader('Authorization', `Bearer ${accessToken}`);
+  const assignedResult = await assignedRequest;
+  if (assignedResult.error) return { data: null, error: assignedResult.error.message };
+
+  return {
+    data: [...owned, ...((assignedResult.data ?? []) as CloudEvent[])]
+      .sort((left, right) =>
+        new Date(right.start_time ?? right.created_at).getTime()
+        - new Date(left.start_time ?? left.created_at).getTime()),
+    error: null,
+  };
 }
 
 export type EventAudienceScope = {
@@ -244,16 +351,25 @@ export async function updateEventAudience(
   eventId: string,
   mode: 'all' | 'groups',
   scope: EventAudienceScope,
+  fallbackSession?: Session | null,
 ): Promise<{ error: string | null }> {
-  const { error } = await supabase.rpc('update_event_audience', {
+  let accessToken: string;
+  try {
+    accessToken = await getFreshAccessToken(fallbackSession);
+  } catch (error) {
+    return { error: error instanceof Error ? error.message : 'Your session could not be refreshed.' };
+  }
+  const request = supabase.rpc('update_event_audience', {
     p_event_id: eventId,
     p_audience_mode: mode,
     p_course_ids: scope.courseIds,
     p_year_level_ids: scope.yearLevelIds,
     p_section_ids: scope.sectionIds,
   });
+  request.setHeader('Authorization', `Bearer ${accessToken}`);
+  const { error } = await request;
   if (error) return { error: error.message };
-  const saved = await getEventAudienceConfig(eventId);
+  const saved = await getEventAudienceConfig(eventId, fallbackSession);
   if (saved.mode !== mode) return { error: 'Participant configuration could not be verified after saving.' };
   if (mode === 'groups' && (!saved.groups.length
     || !sameIdSet(saved.scope.courseIds, scope.courseIds)
@@ -269,31 +385,52 @@ export async function getEventAudienceScope(eventId: string): Promise<EventAudie
   return config.mode === 'groups' ? config.scope : null;
 }
 
-export async function getEventAudienceConfig(eventId: string): Promise<EventAudienceConfig> {
-  const eventResult = await supabase.from('events').select('audience_mode').eq('id', eventId).maybeSingle();
-  if (eventResult.error || !eventResult.data?.audience_mode) return { mode: 'legacy', scope: emptyAudienceScope(), groups: [] };
+export async function getEventAudienceConfig(
+  eventId: string,
+  fallbackSession?: Session | null,
+): Promise<EventAudienceConfig> {
+  const accessToken = await getFreshAccessToken(fallbackSession);
+
+  const eventRequest = supabase
+    .from('events')
+    .select('audience_mode')
+    .eq('id', eventId);
+  eventRequest.setHeader('Authorization', `Bearer ${accessToken}`);
+  const eventResult = await eventRequest.maybeSingle();
+  if (eventResult.error) throw new Error(`Unable to load this event's eligibility settings: ${eventResult.error.message}`);
+  if (!eventResult.data?.audience_mode) {
+    throw new Error('This event has no saved eligibility settings. Refresh the event or contact an administrator.');
+  }
   const mode = eventResult.data.audience_mode as EventAudienceMode;
   if (mode !== 'groups') return { mode, scope: emptyAudienceScope(), groups: [] };
 
-  const scoped = await supabase.rpc('get_event_audience_scope', { p_event_id: eventId });
-  const direct = scoped.error
-    ? await supabase
+  const scopeRequest = supabase.rpc('get_event_audience_scope', { p_event_id: eventId });
+  scopeRequest.setHeader('Authorization', `Bearer ${accessToken}`);
+  const scoped = await scopeRequest;
+  let direct = scoped;
+  if (scoped.error) {
+    const request = supabase
       .from('event_audience')
       .select('course_id, year_level_id, section_id')
-      .eq('event_id', eventId)
-    : scoped;
+      .eq('event_id', eventId);
+    request.setHeader('Authorization', `Bearer ${accessToken}`);
+    direct = await request;
+  }
 
-  const result = direct;
-  const { data, error } = result;
-
-  if (error || !data) return { mode: 'legacy', scope: emptyAudienceScope(), groups: [] };
+  if (direct.error) throw new Error(`Unable to load this event's saved participant groups: ${direct.error.message}`);
+  const { data } = direct;
+  if (!data) throw new Error('The event participant groups could not be loaded.');
   if (data.length === 0) return { mode: 'legacy', scope: emptyAudienceScope(), groups: [] };
 
   const rows = data as { course_id: string | null; year_level_id: string | null; section_id: string | null }[];
-  const groups = rows
-    .filter((row): row is { course_id: string; year_level_id: string; section_id: string } => Boolean(row.course_id && row.year_level_id && row.section_id))
-    .map((row) => ({ courseId: row.course_id, yearLevelId: row.year_level_id, sectionId: row.section_id }));
-  if (!groups.length) return { mode: 'legacy', scope: emptyAudienceScope(), groups: [] };
+  if (rows.some((row) => !row.course_id || !row.year_level_id || !row.section_id)) {
+    throw new Error('This event has incomplete saved participant groups. Edit its eligibility settings before managing attendance.');
+  }
+  const groups = rows.map((row) => ({
+    courseId: row.course_id!,
+    yearLevelId: row.year_level_id!,
+    sectionId: row.section_id!,
+  }));
   return { mode: 'groups', groups, scope: {
     courseIds: Array.from(new Set(groups.map((group) => group.courseId))),
     yearLevelIds: Array.from(new Set(groups.map((group) => group.yearLevelId))),

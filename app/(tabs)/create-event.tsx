@@ -186,7 +186,7 @@ export default function CreateEventTab() {
       venue: venue.trim() || undefined,
       description: description.trim() || undefined,
       audience: mode === 'groups' ? scope : { courseIds: [], yearLevelIds: [], sectionIds: [] },
-    });
+    }, session);
     setSaving(false);
     if (result.error) { setMessage(result.error); return; }
     if (!result.data) { setMessage('The event was created but could not be loaded. Please refresh and try again.'); return; }

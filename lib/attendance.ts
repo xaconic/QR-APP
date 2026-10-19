@@ -1,7 +1,9 @@
-import { supabase } from './supabase';
+import { getFreshAccessToken, supabase } from './supabase';
 import { parseQRPayload } from './qr';
 import { deduplicateStudentAttendanceRecords } from './studentAttendanceStats';
 import { notifyAttendanceHistoryUpdated } from './attendanceHistoryEvents';
+import { getTeacherAuthorizedEvents } from './academic';
+import type { Session } from '@supabase/supabase-js';
 
 export type TeacherEventAttendance = {
   eventId: string;
@@ -20,15 +22,10 @@ export type TeacherEventAttendance = {
 export async function getTeacherEventAttendance(
   teacherId: string
 ): Promise<TeacherEventAttendance[]> {
-  const { data: events, error: eventError } = await supabase
-    .from('events')
-    .select('id, event_code, title, start_time, end_time, status, venue, description')
-    .eq('created_by', teacherId)
-    .order('created_at', { ascending: false });
-
-  if (eventError || !events) return [];
-
-  const eventIds = events.map((e: any) => e.id);
+  const eventResult = await getTeacherAuthorizedEvents(teacherId);
+  if (eventResult.error) throw new Error(eventResult.error);
+  const events = eventResult.data ?? [];
+  const eventIds = events.map((event) => event.id);
   if (eventIds.length === 0) return [];
 
   const { data: attendance, error: attError } = await supabase
@@ -37,22 +34,23 @@ export async function getTeacherEventAttendance(
     .in('event_id', eventIds)
     .order('scanned_at', { ascending: false });
 
-  if (attError || !attendance) return [];
+  if (attError) throw new Error(`Unable to load attendance for managed events: ${attError.message}`);
+  if (!attendance) throw new Error('Attendance records were not returned for managed events.');
 
-  return events.map((e: any) => {
-    const rows = attendance.filter((a: any) => a.event_id === e.id);
+  return events.map((event) => {
+    const rows = attendance.filter((row) => row.event_id === event.id);
 
     return {
-      eventId: e.id,
-      eventCode: e.event_code,
-      title: e.title,
-      startTime: e.start_time,
-      endTime: e.end_time,
-      status: e.status,
+      eventId: event.id,
+      eventCode: event.event_code,
+      title: event.title,
+      startTime: event.start_time,
+      endTime: event.end_time,
+      status: event.status,
       attendeeCount: rows.filter((row: { status: string }) => row.status === 'present' || row.status === 'late').length,
-      attendees: rows.map((a: any) => ({
-        studentId: a.student_id,
-        scannedAt: a.scanned_at,
+      attendees: rows.map((row) => ({
+        studentId: row.student_id,
+        scannedAt: row.scanned_at,
       })),
     };
   });
@@ -62,16 +60,9 @@ export async function getTeacherEventAttendanceByCode(
   teacherId: string,
   eventCode: string
 ): Promise<TeacherEventAttendance | null> {
-  const { data: events, error: eventError } = await supabase
-    .from('events')
-    .select('id, event_code, title, start_time, end_time, status, venue, description')
-    .eq('created_by', teacherId)
-    .eq('event_code', eventCode)
-    .order('created_at', { ascending: false });
-
-  if (eventError || !events) return null;
-
-  const event = events[0];
+  const eventResult = await getTeacherAuthorizedEvents(teacherId);
+  if (eventResult.error) throw new Error(eventResult.error);
+  const event = eventResult.data?.find((item) => item.event_code === eventCode);
   if (!event) return null;
 
   const { data: attendance, error: attError } = await supabase
@@ -80,7 +71,8 @@ export async function getTeacherEventAttendanceByCode(
     .eq('event_id', event.id)
     .order('scanned_at', { ascending: false });
 
-  if (attError || !attendance) return null;
+  if (attError) throw new Error(`Unable to load attendance for ${eventCode}: ${attError.message}`);
+  if (!attendance) throw new Error(`Attendance records were not returned for ${eventCode}.`);
 
   return {
     eventId: event.id,
@@ -104,46 +96,30 @@ export type TeacherEventSummary = {
   status: 'open' | 'closed';
   eventStatus: string;
   endTime: string | null;
+  startTime?: string | null;
+  createdAt?: string;
 };
 
 export async function getTeacherEventSummary(
-  teacherId: string
+  teacherId: string,
+  fallbackSession?: Session | null,
 ): Promise<{ data: TeacherEventSummary[] | null; error: string | null }> {
-  const [ownedResult, assignmentsResult] = await Promise.all([
-    supabase.from('events').select('id').eq('created_by', teacherId).is('archived_at', null),
-    supabase.from('event_staff').select('event_id').eq('teacher_id', teacherId),
-  ]);
-  const queryError = ownedResult.error ?? assignmentsResult.error;
-  if (queryError) {
-    console.error('Unable to load events managed by this teacher.', queryError);
-    return { data: null, error: 'Managed events could not be loaded. Please try again.' };
-  }
-  const eventIds = Array.from(new Set([
-    ...(ownedResult.data ?? []).map((event: { id: string }) => event.id),
-    ...(assignmentsResult.data ?? []).map((event: { event_id: string }) => event.event_id),
-  ]));
-  if (eventIds.length === 0) return { data: [], error: null };
-
-  const { data: events, error: eventError } = await supabase
-    .from('events')
-    .select('id, event_code, title, status, event_status, end_time')
-    .in('id', eventIds)
-    .is('archived_at', null)
-    .order('created_at', { ascending: false });
-
-  if (eventError || !events) {
-    console.error('Unable to load managed event details.', eventError);
+  const result = await getTeacherAuthorizedEvents(teacherId, fallbackSession);
+  if (result.error) {
+    console.error('Unable to load events managed by this teacher.', result.error);
     return { data: null, error: 'Managed events could not be loaded. Please try again.' };
   }
 
   return {
-    data: events.map((event) => ({
+    data: (result.data ?? []).map((event) => ({
       eventId: event.id,
       eventCode: event.event_code,
       title: event.title,
       status: event.status,
-      eventStatus: event.event_status,
+      eventStatus: event.event_status ?? 'upcoming',
       endTime: event.end_time,
+      startTime: event.start_time,
+      createdAt: event.created_at,
     })),
     error: null,
   };
@@ -158,6 +134,7 @@ export type AttendanceRecord = {
   eventId: string;
   eventTitle: string;
   eventStartTime: string | null;
+  lateTime: string | null;
   creatorName: string | null;
   venue: string | null;
   description: string | null;
@@ -177,17 +154,32 @@ export type RegisterResult = {
   status?: 'present' | 'late';
 };
 
-export async function getRotatingCheckinToken(eventId: string): Promise<{
+export async function getRotatingCheckinToken(
+  eventId: string,
+  fallbackSession?: Session | null,
+): Promise<{
   token: string | null;
   expiresAt: string | null;
   error: string | null;
 }> {
   try {
-    const { data, error } = await supabase.rpc('issue_event_checkin_token', {
+    const accessToken = await getFreshAccessToken(fallbackSession);
+    const request = supabase.rpc('issue_event_checkin_token', {
       p_event_id: eventId,
     });
+    request.setHeader('Authorization', `Bearer ${accessToken}`);
+    const { data, error } = await request;
     if (error) {
-      console.error('Unable to issue a rotating event check-in token.', error);
+      const message = error.message.toLowerCase();
+      if (message.includes('not authorized for this event')) {
+        console.warn('The signed-in account is not authorized to issue a check-in token for this event.');
+        return {
+          token: null,
+          expiresAt: null,
+          error: "This account cannot display this event's live QR. Sign in as the event creator or ask an administrator to manage it.",
+        };
+      }
+      console.warn('Unable to issue a rotating event check-in token.', error);
       return { token: null, expiresAt: null, error: 'Live QR unavailable. Check your connection or event status.' };
     }
     if (!data || typeof data !== 'object'
@@ -200,14 +192,13 @@ export async function getRotatingCheckinToken(eventId: string): Promise<{
     }
     return { token: data.token, expiresAt: data.expires_at, error: null };
   } catch (error: unknown) {
-    console.error('Request for a rotating event check-in token failed.', error);
+    console.warn('Request for a rotating event check-in token failed.', error);
     return { token: null, expiresAt: null, error: 'Live QR unavailable. Check your connection and try again.' };
   }
 }
 
 export async function registerAttendance(
-  rawPayload: string,
-  _studentId?: string
+  rawPayload: string
 ): Promise<RegisterResult> {
   const parsed = parseQRPayload(rawPayload);
 
@@ -215,15 +206,30 @@ export async function registerAttendance(
     return { success: false, message: parsed.message };
   }
 
+  let accessToken: string;
+  try {
+    accessToken = await getFreshAccessToken();
+  } catch (error) {
+    return {
+      success: false,
+      message: error instanceof Error ? error.message : 'Your session has expired. Please sign in again.',
+    };
+  }
+
   const payload = parsed.payload;
 
-  const { data, error: attError } = await supabase.rpc('register_attendance', {
+  const attendanceRequest = supabase.rpc('register_attendance', {
     p_event_code: payload.event,
     p_token: payload.token,
   });
+  attendanceRequest.setHeader('Authorization', `Bearer ${accessToken}`);
+  const { data, error: attError } = await attendanceRequest;
 
   if (attError) {
     const message = attError.message.toLowerCase();
+    if (message.includes('not authenticated')) {
+      return { success: false, message: 'Your session has expired. Please sign in again.' };
+    }
     if (message.includes('already registered')) {
       notifyAttendanceHistoryUpdated();
       return {
@@ -273,10 +279,19 @@ export async function registerAttendance(
 
 export async function getAttendanceHistory(
   studentId: string,
-  accessToken?: string,
 ): Promise<AttendanceHistoryResult> {
+  let accessToken: string;
+  try {
+    accessToken = await getFreshAccessToken();
+  } catch (error) {
+    return {
+      data: null,
+      error: error instanceof Error ? error.message : 'Your session has expired. Please sign in again.',
+    };
+  }
+
   const historyRequest = supabase.rpc('get_student_attendance_history');
-  if (accessToken) historyRequest.setHeader('Authorization', `Bearer ${accessToken}`);
+  historyRequest.setHeader('Authorization', `Bearer ${accessToken}`);
   const historyRpc = await historyRequest;
   if (!historyRpc.error && historyRpc.data) {
     const records: AttendanceRecord[] = (historyRpc.data as any[]).map((row) => ({
@@ -288,6 +303,7 @@ export async function getAttendanceHistory(
       eventId: row.event_code ?? '',
       eventTitle: row.event_title ?? '',
       eventStartTime: row.event_start_time ?? null,
+      lateTime: row.late_time ?? null,
       creatorName: row.creator_name ?? row.creator_display_id ?? null,
       venue: row.venue ?? null,
       description: row.description ?? null,
@@ -302,10 +318,10 @@ export async function getAttendanceHistory(
 
   const historyQuery = supabase
     .from('attendance')
-    .select('id, display_id, status, scanned_at, recorded_at, events ( id, event_code, title, start_time, event_status, venue, description )')
+    .select('id, display_id, status, scanned_at, recorded_at, events ( id, event_code, title, start_time, late_time, event_status, venue, description )')
     .eq('student_id', studentId)
     .order('scanned_at', { ascending: false });
-  if (accessToken) historyQuery.setHeader('Authorization', `Bearer ${accessToken}`);
+  historyQuery.setHeader('Authorization', `Bearer ${accessToken}`);
   const { data, error } = await historyQuery;
 
   let historyRows = data;
@@ -313,10 +329,10 @@ export async function getAttendanceHistory(
   if (error && (error.code === '42703' || error.code === 'PGRST200' || error.code === 'PGRST204')) {
     const fallbackQuery = supabase
       .from('attendance')
-      .select('id, display_id, status, scanned_at, recorded_at, events ( id, event_code, title, start_time, event_status )')
+      .select('id, display_id, status, scanned_at, recorded_at, events ( id, event_code, title, start_time, late_time, event_status )')
       .eq('student_id', studentId)
       .order('scanned_at', { ascending: false });
-    if (accessToken) fallbackQuery.setHeader('Authorization', `Bearer ${accessToken}`);
+    fallbackQuery.setHeader('Authorization', `Bearer ${accessToken}`);
     const fallback = await fallbackQuery;
     historyRows = fallback.data as typeof historyRows;
     historyError = fallback.error;
@@ -337,6 +353,7 @@ export async function getAttendanceHistory(
       eventId: row.events?.event_code ?? '',
       eventTitle: row.events?.title ?? '',
       eventStartTime: row.events?.start_time ?? null,
+      lateTime: row.events?.late_time ?? null,
       creatorName: null,
       venue: row.events?.venue ?? null,
       description: row.events?.description ?? null,

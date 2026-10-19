@@ -7,6 +7,7 @@ create table if not exists public.profiles (
   updated_at timestamptz not null default now()
   ,is_active boolean not null default true
   ,deactivated_at timestamptz
+  ,teacher_requested_at timestamptz
 );
 
 create table if not exists public.events (
@@ -131,6 +132,35 @@ create policy "Users can update their own profile"
   using (auth.uid() = id and is_active)
   with check (auth.uid() = id and is_active);
 
+create or replace function public.update_own_profile_name(p_full_name text)
+returns boolean
+language plpgsql
+security definer
+set search_path = public
+as $$
+declare
+  current_user_id uuid := auth.uid();
+begin
+  if current_user_id is null then
+    raise exception 'Authentication is required to update a profile name';
+  end if;
+
+  update public.profiles
+  set full_name = nullif(btrim(coalesce(p_full_name, '')), '')
+  where id = current_user_id
+    and is_active;
+
+  if not found then
+    raise exception 'Profile could not be updated. The account may be inactive.';
+  end if;
+
+  return true;
+end;
+$$;
+
+revoke all on function public.update_own_profile_name(text) from public, anon;
+grant execute on function public.update_own_profile_name(text) to authenticated;
+
 drop policy if exists "Events are readable by any authenticated user" on public.events;
 create policy "Events are readable by any authenticated user"
   on public.events for select
@@ -197,9 +227,17 @@ returns trigger
 language plpgsql
 security definer set search_path = public
 as $$
+declare
+  requested_role text := new.raw_user_meta_data ->> 'role';
 begin
-  insert into public.profiles (id, email, full_name, role)
-  values (new.id, new.email, nullif(btrim(new.raw_user_meta_data ->> 'full_name'), ''), 'student')
+  insert into public.profiles (id, email, full_name, role, teacher_requested_at)
+  values (
+    new.id,
+    new.email,
+    nullif(btrim(new.raw_user_meta_data ->> 'full_name'), ''),
+    'student',
+    case when requested_role = 'teacher' then now() end
+  )
   on conflict (id) do nothing;
   return new;
 end;

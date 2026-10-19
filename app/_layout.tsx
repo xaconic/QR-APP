@@ -14,6 +14,8 @@ import { COLORS } from '@/constants/colors';
 import { initializeAuth } from '@/lib/auth';
 import AnimatedBackground from '@/components/AnimatedBackground';
 
+const FONT_LOAD_FALLBACK_MS = 4000;
+
 void SplashScreen.preventAutoHideAsync().catch((error: unknown) => {
   console.warn('Could not keep the splash screen visible while fonts load.', error);
 });
@@ -27,6 +29,7 @@ export default function RootLayout() {
     Inter_800ExtraBold,
   });
   const [rootLayoutReady, setRootLayoutReady] = useState(false);
+  const [fontFallbackElapsed, setFontFallbackElapsed] = useState(false);
 
   useEffect(() => {
     const stopAuth = initializeAuth();
@@ -35,15 +38,25 @@ export default function RootLayout() {
   }, []);
 
   useEffect(() => {
-    if (fontError) throw fontError;
-    if (!fontsLoaded || !rootLayoutReady) return;
+    if (fontsLoaded) return;
+    const fallbackTimer = setTimeout(() => setFontFallbackElapsed(true), FONT_LOAD_FALLBACK_MS);
+    return () => clearTimeout(fallbackTimer);
+  }, [fontsLoaded]);
+
+  useEffect(() => {
+    if (!fontError) return;
+    console.error('Unable to load the app fonts. Continuing with system fonts.', fontError);
+    setFontFallbackElapsed(true);
+  }, [fontError]);
+
+  useEffect(() => {
+    if ((!fontsLoaded && !fontFallbackElapsed && !fontError) || !rootLayoutReady) return;
     void SplashScreen.hideAsync().catch((error: unknown) => {
       console.warn('Could not hide the splash screen after the app layout was ready.', error);
     });
-  }, [fontsLoaded, fontError, rootLayoutReady]);
+  }, [fontsLoaded, fontFallbackElapsed, fontError, rootLayoutReady]);
 
-  if (fontError) throw fontError;
-  if (!fontsLoaded) return null;
+  if (!fontsLoaded && !fontFallbackElapsed && !fontError) return null;
 
   return (
     <View style={styles.root} onLayout={() => setRootLayoutReady(true)}>

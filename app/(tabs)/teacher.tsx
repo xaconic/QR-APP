@@ -19,6 +19,7 @@ import MotionPressable from '@/components/MotionPressable';
 import { useReducedMotion } from '@/hooks/useReducedMotion';
 import { animateLayoutChange } from '@/lib/motion';
 import { useSafeAreaInsets } from 'react-native-safe-area-context';
+import * as SecureStore from 'expo-secure-store';
 
 import AppButton from '@/components/AppButton';
 import EventAttendanceManager from '@/components/EventAttendanceManager';
@@ -26,7 +27,8 @@ import StatusBadge from '@/components/StatusBadge';
 import { COLORS } from '@/constants/colors';
 import { FONTS } from '@/constants/fonts';
 import { useAuth } from '@/lib/auth';
-import { createEvent, deleteEvent, getEventsByTeacher, setEventStatus, type CloudEvent } from '@/lib/events';
+import { subscribeToSupabaseDataChanges } from '@/lib/supabaseRealtime';
+import { createEvent, deleteEvent, setEventStatus, type CloudEvent } from '@/lib/events';
 import { getProfileWithError, type Role } from '@/lib/profiles';
 import { getAcademicSections, getCourses, getYearLevels, getTeacherAuthorizedEvents, type AcademicSection, type Course, type YearLevel } from '@/lib/academic';
 
@@ -61,6 +63,46 @@ const QUICK_END_OPTIONS = [
 type EditTarget = 'start' | 'end';
 type MyEventsSort = 'date' | 'name';
 
+type TeacherSectionState = {
+  attendance: boolean;
+  myEvents: boolean;
+};
+
+const DEFAULT_TEACHER_SECTION_STATE: TeacherSectionState = {
+  attendance: false,
+  myEvents: false,
+};
+
+function getTeacherSectionStorageKey(userId: string) {
+  return `teacher-dashboard-sections-${userId}`;
+}
+
+async function loadTeacherSectionState(userId: string): Promise<TeacherSectionState> {
+  const key = getTeacherSectionStorageKey(userId);
+  const stored = Platform.OS === 'web'
+    ? typeof window !== 'undefined' ? window.localStorage.getItem(key) : null
+    : await SecureStore.getItemAsync(key);
+  if (!stored) return DEFAULT_TEACHER_SECTION_STATE;
+
+  const parsed: unknown = JSON.parse(stored);
+  if (!parsed || typeof parsed !== 'object') return DEFAULT_TEACHER_SECTION_STATE;
+  const values = parsed as Partial<Record<keyof TeacherSectionState, unknown>>;
+  return {
+    attendance: typeof values.attendance === 'boolean' ? values.attendance : false,
+    myEvents: typeof values.myEvents === 'boolean' ? values.myEvents : false,
+  };
+}
+
+async function saveTeacherSectionState(userId: string, state: TeacherSectionState) {
+  const key = getTeacherSectionStorageKey(userId);
+  const value = JSON.stringify(state);
+  if (Platform.OS === 'web') {
+    if (typeof window !== 'undefined') window.localStorage.setItem(key, value);
+    return;
+  }
+  await SecureStore.setItemAsync(key, value);
+}
+
 export default function TeacherScreen() {
   const { user, session } = useAuth();
   const insets = useSafeAreaInsets();
@@ -77,10 +119,13 @@ export default function TeacherScreen() {
   const [messageTone, setMessageTone] = useState<'info' | 'success' | 'error'>('info');
   const [role, setRole] = useState<Role | null>(null);
   const [roleError, setRoleError] = useState<string | null>(null);
+  const [eventsError, setEventsError] = useState<string | null>(null);
   const [roleLoading, setRoleLoading] = useState(true);
   const [events, setEvents] = useState<CloudEvent[]>([]);
   const [myEventsSort, setMyEventsSort] = useState<MyEventsSort>('date');
-  const [myEventsExpanded, setMyEventsExpanded] = useState(true);
+  const [attendanceExpanded, setAttendanceExpanded] = useState(DEFAULT_TEACHER_SECTION_STATE.attendance);
+  const [myEventsExpanded, setMyEventsExpanded] = useState(DEFAULT_TEACHER_SECTION_STATE.myEvents);
+  const [sectionsLoadedForUserId, setSectionsLoadedForUserId] = useState<string | null>(null);
   const myEventsChevron = useRef(new Animated.Value(1)).current;
   const [statusLoading, setStatusLoading] = useState<string | null>(null);
   const [deletingEventId, setDeletingEventId] = useState<string | null>(null);
@@ -91,6 +136,44 @@ export default function TeacherScreen() {
   const [audienceYearLevelIds, setAudienceYearLevelIds] = useState<string[]>([]);
   const [audienceSectionIds, setAudienceSectionIds] = useState<string[]>([]);
   const [audienceLoading, setAudienceLoading] = useState(false);
+
+  useEffect(() => {
+    const userId = user?.id;
+    if (!userId) {
+      setAttendanceExpanded(DEFAULT_TEACHER_SECTION_STATE.attendance);
+      setMyEventsExpanded(DEFAULT_TEACHER_SECTION_STATE.myEvents);
+      setSectionsLoadedForUserId(null);
+      return;
+    }
+
+    let cancelled = false;
+    setSectionsLoadedForUserId(null);
+    loadTeacherSectionState(userId).then((state) => {
+      if (cancelled) return;
+      setAttendanceExpanded(state.attendance);
+      setMyEventsExpanded(state.myEvents);
+      myEventsChevron.setValue(state.myEvents ? 1 : 0);
+      setSectionsLoadedForUserId(userId);
+    }).catch((error: unknown) => {
+      console.error('Unable to restore teacher dashboard section state.', error);
+      if (cancelled) return;
+      setAttendanceExpanded(DEFAULT_TEACHER_SECTION_STATE.attendance);
+      setMyEventsExpanded(DEFAULT_TEACHER_SECTION_STATE.myEvents);
+      myEventsChevron.setValue(0);
+      setSectionsLoadedForUserId(userId);
+    });
+    return () => {
+      cancelled = true;
+    };
+  }, [myEventsChevron, user?.id]);
+
+  useEffect(() => {
+    if (!user?.id || sectionsLoadedForUserId !== user.id) return;
+    saveTeacherSectionState(user.id, { attendance: attendanceExpanded, myEvents: myEventsExpanded })
+      .catch((error: unknown) => {
+        console.error('Unable to save teacher dashboard section state.', error);
+      });
+  }, [attendanceExpanded, myEventsExpanded, sectionsLoadedForUserId, user?.id]);
 
   useEffect(() => {
     let active = true;
@@ -113,35 +196,56 @@ export default function TeacherScreen() {
   useFocusEffect(
     useCallback(() => {
       let active = true;
+      let refreshTimer: ReturnType<typeof setTimeout> | undefined;
 
-      if (!user) {
-        setRole(null);
-        setRoleLoading(false);
-        return () => {
-          active = false;
-        };
-      }
-
-      setRoleError(null);
-      getProfileWithError(user.id, session?.access_token)
-        .then(async ({ profile, error }) => {
+      const loadTeacherData = async (showLoading: boolean) => {
+        if (!user) {
+          setRole(null);
+          setEvents([]);
+          setEventsError(null);
+          setRoleLoading(false);
+          return;
+        }
+        if (showLoading) setRoleLoading(true);
+        setRoleError(null);
+        setEventsError(null);
+        try {
+          const { profile, error } = await getProfileWithError(user.id, session?.access_token);
           if (!active) return;
           if (error) throw new Error(error);
           if (!profile) throw new Error('No Acadence profile was found for this account.');
           setRole(profile.role);
-          if (profile.role === 'teacher' && profile.is_active) setEvents((await getTeacherAuthorizedEvents(user.id)) as CloudEvent[]);
+          if (profile.role === 'teacher' && profile.is_active) {
+            const result = await getTeacherAuthorizedEvents(user.id, session);
+            if (!active) return;
+            if (result.error) {
+              console.error('Unable to load events assigned to this teacher.', result.error);
+              setEventsError('Your events could not be loaded. Check your connection and try again.');
+            } else {
+              setEvents(result.data ?? []);
+            }
+          } else {
+            setEvents([]);
+          }
           setRoleLoading(false);
-        })
-        .catch((error: unknown) => {
+        } catch (error) {
           if (!active) return;
           console.error('Unable to verify the teacher account profile.', error);
           setRole(null);
           setRoleError(error instanceof Error ? error.message : 'Unable to verify your account profile.');
           setRoleLoading(false);
-        });
+        }
+      };
 
+      void loadTeacherData(true);
+      const unsubscribe = subscribeToSupabaseDataChanges(() => {
+        if (refreshTimer) clearTimeout(refreshTimer);
+        refreshTimer = setTimeout(() => { void loadTeacherData(false); }, 200);
+      });
       return () => {
         active = false;
+        if (refreshTimer) clearTimeout(refreshTimer);
+        unsubscribe();
       };
     }, [session?.access_token, user])
   );
@@ -247,7 +351,7 @@ export default function TeacherScreen() {
       ? { courseIds: audienceCourseIds, yearLevelIds: audienceYearLevelIds, sectionIds: audienceSectionIds }
       : undefined;
 
-    createEvent({ ...event, audience }).then(({ error }) => {
+    createEvent({ ...event, audience }, session).then(async ({ error }) => {
       if (error) {
         setMessageTone('error');
         setMessage(`Could not save the event: ${error}`);
@@ -256,7 +360,20 @@ export default function TeacherScreen() {
 
       setMessage('Event saved! Scan the QR with the Scan tab to test it.');
       setMessageTone('success');
-      if (user) getEventsByTeacher(user.id).then(setEvents);
+      if (user) {
+        const result = await getTeacherAuthorizedEvents(user.id, session);
+        if (result.error) {
+          console.error('Event was created, but the teacher event list could not be refreshed.', result.error);
+          setMessageTone('error');
+          setMessage('Event was saved, but the event list could not be refreshed. Please reopen this screen.');
+        } else {
+          setEvents(result.data ?? []);
+        }
+      }
+    }).catch((error: unknown) => {
+      console.error('Unable to refresh the teacher event list after creating an event.', error);
+      setMessageTone('error');
+      setMessage('Event may have been saved, but the event list could not be refreshed. Please reopen this screen.');
     });
   };
 
@@ -347,7 +464,7 @@ export default function TeacherScreen() {
       keyboardShouldPersistTaps="handled"
     >
       <Text style={styles.title}>Teacher Events</Text>
-      <Text style={styles.subtitle}>Manage your events and attendance from here. Use the centered + button to create an event QR.</Text>
+      <Text style={styles.subtitle}>Create event QR codes with the + button. Manage your events and attendance below.</Text>
 
       {message && (
         <View style={[
@@ -368,7 +485,11 @@ export default function TeacherScreen() {
         </View>
       )}
 
-      <EventAttendanceManager events={events} />
+      <EventAttendanceManager
+        events={events}
+        expanded={attendanceExpanded}
+        onExpandedChange={setAttendanceExpanded}
+      />
 
       {editTarget && (
         <View style={styles.pickerContainer}>
@@ -412,7 +533,7 @@ export default function TeacherScreen() {
         {myEventsExpanded ? (
           <View style={styles.myEventsContent}>
             {events.length > 0 && <View style={styles.eventsSortRow}>
-              <Text style={styles.eventsSortLabel}>Sort by</Text>
+              <Text style={styles.eventsSortLabel}>Sort events by</Text>
               <View style={styles.eventsSortOptions} accessibilityRole="radiogroup">
                 {(['date', 'name'] as const).map((option) => {
                   const selected = myEventsSort === option;
@@ -435,7 +556,13 @@ export default function TeacherScreen() {
                 })}
               </View>
             </View>}
-            {sortedEvents.length === 0 ? (
+            {eventsError ? (
+              <View style={styles.eventsEmpty}>
+                <Ionicons name="alert-circle-outline" size={22} color={COLORS.danger} />
+                <Text style={styles.eventsEmptyTitle}>Events unavailable</Text>
+                <Text style={styles.eventsEmptyText}>{eventsError}</Text>
+              </View>
+            ) : sortedEvents.length === 0 ? (
               <View style={styles.eventsEmpty}>
                 <Ionicons name="calendar-outline" size={22} color={COLORS.textMuted} />
                 <Text style={styles.eventsEmptyTitle}>No events yet</Text>
@@ -542,7 +669,7 @@ const styles = StyleSheet.create({
     fontFamily: FONTS.regular,
     color: COLORS.textSecondary,
     lineHeight: 20,
-    marginBottom: 18,
+    marginBottom: 12,
   },
   label: {
     fontSize: 14,
@@ -689,16 +816,16 @@ const styles = StyleSheet.create({
   feedbackError: { backgroundColor: `${COLORS.danger}12`, borderColor: `${COLORS.danger}44` },
   feedbackText: { flex: 1, color: COLORS.primary, fontSize: 12, lineHeight: 17, fontFamily: FONTS.medium },
   feedbackErrorText: { color: COLORS.danger },
-  myEventsContainer: { marginTop: 12, backgroundColor: COLORS.card, borderWidth: 1, borderColor: COLORS.border, borderRadius: 12, overflow: 'hidden' },
+  myEventsContainer: { marginTop: 0, backgroundColor: COLORS.card, borderWidth: 1, borderColor: COLORS.border, borderRadius: 12, overflow: 'hidden' },
   myEventsHeader: { minHeight: 58, flexDirection: 'row', alignItems: 'center', justifyContent: 'space-between', paddingHorizontal: 14, paddingVertical: 10 },
   myEventsHeaderPressed: { backgroundColor: COLORS.surface },
-  myEventsHeading: { flex: 1, flexDirection: 'row', alignItems: 'center', gap: 8, marginRight: 12 },
+  myEventsHeading: { flex: 1, flexDirection: 'row', alignItems: 'center', gap: 10, marginRight: 12 },
   chevronCircle: { width: 32, height: 32, borderRadius: 10, borderWidth: 1, borderColor: COLORS.border, backgroundColor: COLORS.surface, alignItems: 'center', justifyContent: 'center' },
   myEventsContent: { borderTopWidth: 1, borderTopColor: COLORS.border, padding: 14 },
   sectionTitle: { fontSize: 16, fontWeight: '700', fontFamily: FONTS.bold, color: COLORS.textPrimary },
-  eventCount: { minWidth: 22, height: 22, textAlign: 'center', textAlignVertical: 'center', overflow: 'hidden', borderRadius: 11, paddingHorizontal: 6, backgroundColor: COLORS.surface, color: COLORS.textSecondary, fontSize: 11, fontFamily: FONTS.semiBold },
+  eventCount: { minWidth: 26, height: 26, textAlign: 'center', textAlignVertical: 'center', includeFontPadding: false, overflow: 'hidden', borderRadius: 13, paddingHorizontal: 7, borderWidth: 1, borderColor: `${COLORS.primary}55`, backgroundColor: `${COLORS.primary}20`, color: COLORS.primaryLight, fontSize: 12, lineHeight: 16, fontFamily: FONTS.bold },
   eventsSortRow: { flexDirection: 'row', alignItems: 'center', justifyContent: 'space-between', marginBottom: 12 },
-  eventsSortLabel: { color: COLORS.textMuted, fontSize: 12, fontFamily: FONTS.medium },
+  eventsSortLabel: { color: COLORS.textSecondary, fontSize: 12, fontFamily: FONTS.semiBold },
   eventsSortOptions: { width: 132, maxWidth: '58%', minHeight: 38, flexDirection: 'row', alignItems: 'center', padding: 3, borderWidth: 1, borderColor: COLORS.border, borderRadius: 10, backgroundColor: `${COLORS.background}99` },
   eventsSortOption: { flex: 1, minWidth: 0, minHeight: 30, alignItems: 'center', justifyContent: 'center', borderRadius: 7, paddingHorizontal: 8 },
   eventsSortOptionSelected: { backgroundColor: `${COLORS.primary}24`, borderWidth: 1, borderColor: `${COLORS.primary}88` },

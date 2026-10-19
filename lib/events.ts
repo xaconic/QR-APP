@@ -1,4 +1,5 @@
-import { supabase } from './supabase';
+import { getFreshAccessToken, supabase } from './supabase';
+import type { Session } from '@supabase/supabase-js';
 import { getEventAudienceConfig, type EventAudienceScope } from './academic';
 
 export type Event = {
@@ -52,6 +53,29 @@ export type DiscoveryEvent = CloudEvent & {
   attendanceStatus?: 'present' | 'late' | null;
 };
 
+export async function getEventCreatorNames(
+  creatorIds: string[],
+  accessToken?: string,
+): Promise<Record<string, string>> {
+  const uniqueCreatorIds = Array.from(new Set(creatorIds.filter(Boolean)));
+  if (uniqueCreatorIds.length === 0) return {};
+
+  const request = supabase
+    .from('profiles')
+    .select('id, full_name, email')
+    .in('id', uniqueCreatorIds);
+  if (accessToken) request.setHeader('Authorization', `Bearer ${accessToken}`);
+  const { data, error } = await request;
+  if (error) throw error;
+
+  return Object.fromEntries(
+    (data ?? []).map((profile: { id: string; full_name: string | null; email: string }) => [
+      profile.id,
+      profile.full_name?.trim() || profile.email || 'Unknown user',
+    ]),
+  );
+}
+
 function sanitizeEventText(value: string, maxLength = 120) {
   return value
     .replace(/\\/g, '')
@@ -71,40 +95,58 @@ export function normalizeEventCode(value: string) {
 }
 
 export async function createEvent(
-  event: Event
+  event: Event,
+  fallbackSession?: Session | null,
 ): Promise<{ data: CloudEvent | null; error: string | null }> {
-  const {
-    data: { user },
-  } = await supabase.auth.getUser();
+  try {
+    const accessToken = await getFreshAccessToken(fallbackSession);
+    const { data: authData, error: authError } = await supabase.auth.getUser(accessToken);
+    if (authError || !authData.user?.id) {
+      return { data: null, error: authError?.message ?? 'You must be signed in to create an event.' };
+    }
+    if (fallbackSession && authData.user.id !== fallbackSession.user.id) {
+      return { data: null, error: 'The signed-in account changed. Please sign in again before creating an event.' };
+    }
 
-  if (!user?.id) {
-    return { data: null, error: 'You must be signed in to create an event.' };
-  }
+    const safeEventId = normalizeEventCode(event.eventId);
+    const safeTitle = sanitizeEventText(event.title, 120);
 
-  const safeEventId = normalizeEventCode(event.eventId);
-  const safeTitle = sanitizeEventText(event.title, 120);
+    if (!safeEventId || !safeTitle) {
+      return { data: null, error: 'Event title and code are required.' };
+    }
 
-  if (!safeEventId || !safeTitle) {
-    return { data: null, error: 'Event title and code are required.' };
-  }
+    const request = supabase.rpc('create_event_with_audience_late_details', {
+      p_event_code: safeEventId,
+      p_title: safeTitle,
+      p_start_time: event.start || null,
+      p_end_time: event.end || null,
+      p_late_time: event.lateAfter || null,
+      p_venue: event.venue ? sanitizeEventText(event.venue, 160) : null,
+      p_description: event.description ? sanitizeEventText(event.description, 2000) : null,
+      p_course_ids: event.audience?.courseIds ?? [],
+      p_year_level_ids: event.audience?.yearLevelIds ?? [],
+      p_section_ids: event.audience?.sectionIds ?? [],
+    });
+    request.setHeader('Authorization', `Bearer ${accessToken}`);
+    const { data, error } = await request;
 
-  const { data, error } = await supabase.rpc('create_event_with_audience_late_details', {
-    p_event_code: safeEventId,
-    p_title: safeTitle,
-    p_start_time: event.start || null,
-    p_end_time: event.end || null,
-    p_late_time: event.lateAfter || null,
-    p_venue: event.venue ? sanitizeEventText(event.venue, 160) : null,
-    p_description: event.description ? sanitizeEventText(event.description, 2000) : null,
-    p_course_ids: event.audience?.courseIds ?? [],
-    p_year_level_ids: event.audience?.yearLevelIds ?? [],
-    p_section_ids: event.audience?.sectionIds ?? [],
-  });
+    if (error) {
+      const message = error.message.toLowerCase();
+      if (message.includes('duplicate') || message.includes('events_event_code') || message.includes('event_code')) {
+        return { data: null, error: 'That event code is already in use. Please enter a different event code.' };
+      }
+      return { data: null, error: error.message };
+    }
 
-  if (!error) {
     const created = data as CloudEvent | null;
     if (!created?.id) return { data: null, error: 'The event was saved but its record could not be verified.' };
-    const savedAudience = await getEventAudienceConfig(created.id);
+    if (created.created_by !== authData.user.id) {
+      return {
+        data: null,
+        error: 'The event was saved, but this account is not listed as its creator. Contact an administrator before sharing its QR code.',
+      };
+    }
+    const savedAudience = await getEventAudienceConfig(created.id, fallbackSession);
     const requestedGroups = event.audience?.courseIds?.length || event.audience?.yearLevelIds?.length || event.audience?.sectionIds?.length;
     if (requestedGroups && (savedAudience.mode !== 'groups' || !savedAudience.groups.length
       || !sameIdSet(savedAudience.scope.courseIds, event.audience?.courseIds ?? [])
@@ -116,12 +158,12 @@ export async function createEvent(
       return { data: null, error: 'The event was saved but its All Students configuration could not be verified.' };
     }
     return { data: created, error: null };
+  } catch (error) {
+    return {
+      data: null,
+      error: error instanceof Error ? error.message : 'The event could not be created. Check your connection and try again.',
+    };
   }
-  const message = error.message.toLowerCase();
-  if (message.includes('duplicate') || message.includes('events_event_code') || message.includes('event_code')) {
-    return { data: null, error: 'That event code is already in use. Please enter a different event code.' };
-  }
-  return { data: null, error: error.message };
 }
 
 export async function getEventById(eventId: string): Promise<CloudEvent | null> {
@@ -135,10 +177,22 @@ export async function getEventById(eventId: string): Promise<CloudEvent | null> 
   return data as CloudEvent;
 }
 
-export async function getManagedEventById(eventId: string): Promise<CloudEvent | null> {
-  const { data, error } = await supabase.rpc('get_managed_event', { p_event_id: eventId });
-  if (error || !data) return null;
-  return data as CloudEvent;
+export async function getManagedEventById(
+  eventId: string,
+  fallbackSession?: Session | null,
+): Promise<{ data: CloudEvent | null; error: string | null }> {
+  let accessToken: string;
+  try {
+    accessToken = await getFreshAccessToken(fallbackSession);
+  } catch (error) {
+    return { data: null, error: error instanceof Error ? error.message : 'Your session could not be refreshed.' };
+  }
+  const request = supabase.rpc('get_managed_event', { p_event_id: eventId });
+  request.setHeader('Authorization', `Bearer ${accessToken}`);
+  const { data, error } = await request;
+  if (error) return { data: null, error: error.message };
+  if (!data) return { data: null, error: 'The event was not found or is not available to this account.' };
+  return { data: data as CloudEvent, error: null };
 }
 
 export async function updateEvent(
@@ -240,8 +294,19 @@ export async function archiveEvent(eventId: string): Promise<{ error: string | n
   return { error: error.message };
 }
 
-export async function deleteEvent(eventId: string): Promise<{ error: string | null }> {
-  const { error } = await supabase.rpc('delete_event', { p_event_id: eventId });
+export async function deleteEvent(
+  eventId: string,
+  fallbackSession?: Session | null,
+): Promise<{ error: string | null }> {
+  let accessToken: string;
+  try {
+    accessToken = await getFreshAccessToken(fallbackSession);
+  } catch (error) {
+    return { error: error instanceof Error ? error.message : 'Your session could not be refreshed.' };
+  }
+  const request = supabase.rpc('delete_event', { p_event_id: eventId });
+  request.setHeader('Authorization', `Bearer ${accessToken}`);
+  const { error } = await request;
   if (!error) return { error: null };
 
   const message = error.message.toLowerCase();

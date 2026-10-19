@@ -1,4 +1,5 @@
-import { supabase } from './supabase';
+import { getFreshAccessToken, supabase } from './supabase';
+import type { Session } from '@supabase/supabase-js';
 
 export type Role = 'student' | 'teacher' | 'admin';
 
@@ -137,16 +138,31 @@ export async function getProfile(userId: string, accessToken?: string): Promise<
 
 export async function updateProfile(
   userId: string,
-  updates: { full_name?: string }
+  updates: { full_name?: string },
+  fallbackSession?: Session | null,
 ): Promise<{ error: string | null }> {
-  const { data, error } = await supabase
-    .from('profiles')
-    .update(updates)
-    .eq('id', userId)
-    .select('id')
-    .maybeSingle();
+  if (updates.full_name === undefined) return { error: 'No profile changes were provided.' };
 
-  return {
-    error: error?.message ?? (data ? null : 'Profile could not be updated. The account may be inactive.'),
-  };
+  try {
+    const accessToken = await getFreshAccessToken(fallbackSession);
+    const { data: authData, error: authError } = await supabase.auth.getUser(accessToken);
+    if (authError) return { error: authError.message };
+    if (authData.user?.id !== userId) {
+      return { error: 'The active sign-in session does not match this account. Please sign in again.' };
+    }
+
+    const request = supabase.rpc('update_own_profile_name', {
+      p_full_name: updates.full_name,
+    });
+    request.setHeader('Authorization', `Bearer ${accessToken}`);
+    const { data, error } = await request;
+    if (error) return { error: error.message };
+    return data === true
+      ? { error: null }
+      : { error: 'Profile could not be updated. The account may be inactive.' };
+  } catch (error) {
+    return {
+      error: error instanceof Error ? error.message : 'Profile could not be updated. Please try again.',
+    };
+  }
 }

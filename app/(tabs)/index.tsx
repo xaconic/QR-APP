@@ -1,8 +1,9 @@
 import Ionicons from '@expo/vector-icons/Ionicons';
 import { router, useFocusEffect } from 'expo-router';
-import { useCallback, useEffect, useMemo, useState } from 'react';
-import { ActivityIndicator, FlatList, Modal, RefreshControl, ScrollView, StyleSheet, Text, TextInput, View } from 'react-native';
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
+import { ActivityIndicator, Animated, Easing, FlatList, Modal, RefreshControl, ScrollView, StyleSheet, Text, TextInput, View } from 'react-native';
 import MotionPressable from '@/components/MotionPressable';
+import { useReducedMotion } from '@/hooks/useReducedMotion';
 import { useSafeAreaInsets } from 'react-native-safe-area-context';
 
 import AppButton from '@/components/AppButton';
@@ -11,10 +12,13 @@ import StatusBadge from '@/components/StatusBadge';
 import { COLORS } from '@/constants/colors';
 import { FONTS } from '@/constants/fonts';
 import { useAuth } from '@/lib/auth';
-import { getDiscoveryEvents, type DiscoveryEvent } from '@/lib/events';
+import { getDiscoveryEvents, getEventCreatorNames, type DiscoveryEvent } from '@/lib/events';
 import { getProfileWithError, type Role } from '@/lib/profiles';
 import { formatEventDate, formatEventTimeRange } from '@/lib/formatters';
-import { supabase } from '@/lib/supabase';
+import {
+  subscribeToSupabaseDataChanges,
+  subscribeToSupabaseRealtimeStatus,
+} from '@/lib/supabaseRealtime';
 
 type Filter = 'all' | 'open' | 'closed' | 'attended';
 type SortBy = 'date' | 'name';
@@ -22,17 +26,34 @@ type SortBy = 'date' | 'name';
 export default function HomeScreen() {
   const { user, session } = useAuth();
   const insets = useSafeAreaInsets();
+  const reduceMotion = useReducedMotion();
   const [events, setEvents] = useState<DiscoveryEvent[]>([]);
+  const [eventCreatorNames, setEventCreatorNames] = useState<Record<string, string>>({});
   const [role, setRole] = useState<Role | null>(null);
   const [search, setSearch] = useState('');
   const [filter, setFilter] = useState<Filter>('all');
   const [sortBy, setSortBy] = useState<SortBy>('date');
   const [sortMenuOpen, setSortMenuOpen] = useState(false);
+  const sortMenuProgress = useRef(new Animated.Value(0)).current;
   const [selected, setSelected] = useState<DiscoveryEvent | null>(null);
   const [loading, setLoading] = useState(true);
   const [refreshing, setRefreshing] = useState(false);
   const [loadError, setLoadError] = useState<string | null>(null);
   const [liveUpdateError, setLiveUpdateError] = useState(false);
+
+  useEffect(() => {
+    sortMenuProgress.stopAnimation();
+    if (reduceMotion === false) {
+      Animated.timing(sortMenuProgress, {
+        toValue: sortMenuOpen ? 1 : 0,
+        duration: 160,
+        easing: sortMenuOpen ? Easing.out(Easing.cubic) : Easing.in(Easing.cubic),
+        useNativeDriver: true,
+      }).start();
+    } else {
+      sortMenuProgress.setValue(sortMenuOpen ? 1 : 0);
+    }
+  }, [reduceMotion, sortMenuOpen, sortMenuProgress]);
 
   const load = useCallback(async (refresh = false, background = false) => {
     if (refresh) setRefreshing(true);
@@ -50,6 +71,21 @@ export default function HomeScreen() {
         session.access_token,
       );
       setEvents(discovered);
+      if (loadedProfile.role === 'admin') {
+        try {
+          const creatorNames = await getEventCreatorNames(
+            discovered.map((event) => event.created_by ?? ''),
+            session.access_token,
+          );
+          setEventCreatorNames(creatorNames);
+        } catch (error) {
+          console.error('Unable to load event creator names for the administrator.', error);
+          setEventCreatorNames({});
+          setLoadError('Event creator names could not be loaded. Pull down to retry.');
+        }
+      } else {
+        setEventCreatorNames({});
+      }
     } catch (error) {
       if (!refresh && !background) setEvents([]);
       setLoadError(error instanceof Error ? error.message : 'Unable to load events. Please try again.');
@@ -60,36 +96,22 @@ export default function HomeScreen() {
       }
     }
   }, [session?.access_token, user]);
-  useFocusEffect(useCallback(() => { load(); }, [load]));
-
-  useEffect(() => {
-    if (!user?.id || role !== 'student') return;
-
+  useFocusEffect(useCallback(() => {
+    void load();
     let refreshTimer: ReturnType<typeof setTimeout> | undefined;
-    const channel = supabase
-      .channel(`student-attendance-${user.id}`)
-      .on(
-        'postgres_changes',
-        { event: '*', schema: 'public', table: 'attendance', filter: `student_id=eq.${user.id}` },
-        () => {
-          if (refreshTimer) clearTimeout(refreshTimer);
-          refreshTimer = setTimeout(() => { void load(false, true); }, 150);
-        }
-      )
-      .subscribe((status, error) => {
-        if (status === 'SUBSCRIBED') {
-          setLiveUpdateError(false);
-        } else if (status === 'CHANNEL_ERROR' || status === 'TIMED_OUT') {
-          console.error('Live attendance updates are unavailable.', error);
-          setLiveUpdateError(true);
-        }
-      });
-
+    const unsubscribe = subscribeToSupabaseDataChanges(() => {
+      if (refreshTimer) clearTimeout(refreshTimer);
+      refreshTimer = setTimeout(() => { void load(false, true); }, 200);
+    });
     return () => {
       if (refreshTimer) clearTimeout(refreshTimer);
-      void supabase.removeChannel(channel);
+      unsubscribe();
     };
-  }, [load, role, user?.id]);
+  }, [load]));
+
+  useEffect(() => {
+    return subscribeToSupabaseRealtimeStatus((connected) => setLiveUpdateError(!connected));
+  }, []);
 
   useEffect(() => {
     if (!selected) return;
@@ -114,10 +136,61 @@ export default function HomeScreen() {
       <Text style={styles.subtitle}>Find what’s happening around campus.</Text>
     </View>
     <View style={[styles.controls, sortMenuOpen && styles.controlsMenuOpen]}>
-      <View style={styles.searchBox}>
-        <Ionicons name="search-outline" size={19} color={COLORS.primaryLight} />
+      <View style={[styles.searchBox, sortMenuOpen && styles.searchBoxMenuOpen]}>
+        <Ionicons name="search-outline" size={19} color={COLORS.primaryLight} style={styles.searchIcon} />
         <TextInput style={styles.searchInput} value={search} onChangeText={setSearch} placeholder="Search events" placeholderTextColor={COLORS.textMuted} accessibilityLabel="Search by event title or code" />
-        {!!search && <MotionPressable onPress={() => setSearch('')} accessibilityRole="button" accessibilityLabel="Clear search"><Ionicons name="close-circle" size={19} color={COLORS.textSecondary} /></MotionPressable>}
+        {!!search && <MotionPressable style={styles.searchClearButton} onPress={() => setSearch('')} accessibilityRole="button" accessibilityLabel="Clear search"><Ionicons name="close-circle" size={19} color={COLORS.textSecondary} /></MotionPressable>}
+        <View style={[styles.sortControlWrap, sortMenuOpen && styles.sortControlOpen]}>
+          <MotionPressable
+            style={({ pressed }) => [styles.sortDropdown, pressed && styles.sortDropdownPressed]}
+            onPress={() => setSortMenuOpen((open) => !open)}
+            accessibilityRole="button"
+            accessibilityLabel={`Sort events by ${sortBy === 'date' ? 'date' : 'name A to Z'}`}
+            accessibilityState={{ expanded: sortMenuOpen }}
+          >
+            <Ionicons name="swap-vertical" size={19} color={COLORS.primaryLight} />
+          </MotionPressable>
+          <Animated.View
+            pointerEvents={sortMenuOpen ? 'auto' : 'none'}
+            accessibilityElementsHidden={!sortMenuOpen}
+            importantForAccessibility={sortMenuOpen ? 'auto' : 'no-hide-descendants'}
+            style={[
+              styles.sortMenu,
+              {
+                opacity: sortMenuProgress,
+                transform: [{
+                  translateY: sortMenuProgress.interpolate({
+                    inputRange: [0, 1],
+                    outputRange: [-5, 0],
+                  }),
+                }, {
+                  scale: sortMenuProgress.interpolate({
+                    inputRange: [0, 1],
+                    outputRange: [0.98, 1],
+                  }),
+                }],
+              },
+            ]}
+          >
+            {(['date', 'name'] as const).map((option) => {
+              const selectedSort = sortBy === option;
+              return <MotionPressable
+                key={option}
+                style={({ pressed }) => [
+                  styles.sortOption,
+                  selectedSort && styles.sortOptionSelected,
+                  pressed && styles.sortOptionPressed,
+                ]}
+                onPress={() => { setSortBy(option); setSortMenuOpen(false); }}
+                accessibilityRole="button"
+                accessibilityState={{ selected: selectedSort }}
+              >
+                <Text style={[styles.sortOptionText, selectedSort && styles.sortOptionTextSelected]}>{option === 'date' ? 'Date' : 'Name (A-Z)'}</Text>
+                {selectedSort && <Ionicons name="checkmark" size={15} color={COLORS.primaryLight} />}
+              </MotionPressable>;
+            })}
+          </Animated.View>
+        </View>
       </View>
       <ScrollView
         horizontal
@@ -141,40 +214,11 @@ export default function HomeScreen() {
           </MotionPressable>;
         })}
       </ScrollView>
-      <View style={[styles.sortRow, sortMenuOpen && styles.sortRowOpen]}>
-        <Text style={styles.sortByLabel}>Sort by</Text>
-        <View style={[styles.sortControlWrap, sortMenuOpen && styles.sortControlOpen]}>
-          <MotionPressable
-            style={({ pressed }) => [styles.sortDropdown, pressed && styles.sortDropdownPressed]}
-            onPress={() => setSortMenuOpen((open) => !open)}
-            accessibilityRole="button"
-            accessibilityLabel={`Sort events by ${sortBy}`}
-            accessibilityState={{ expanded: sortMenuOpen }}
-          >
-            <Text style={styles.sortLabel}>{sortBy === 'date' ? 'Date' : 'Name'}</Text>
-            <Ionicons name={sortMenuOpen ? 'chevron-up' : 'chevron-down'} size={15} color={COLORS.primary} />
-          </MotionPressable>
-          {sortMenuOpen && <View style={styles.sortMenu}>
-            {(['date', 'name'] as const).map((option) => {
-              const selectedSort = sortBy === option;
-              return <MotionPressable
-                key={option}
-                style={({ pressed }) => [styles.sortOption, selectedSort && styles.sortOptionSelected, pressed && styles.sortDropdownPressed]}
-                onPress={() => { setSortBy(option); setSortMenuOpen(false); }}
-                accessibilityRole="button"
-                accessibilityState={{ selected: selectedSort }}
-              >
-                <Text style={[styles.sortOptionText, selectedSort && styles.sortOptionTextSelected]}>{option === 'date' ? 'Date' : 'Name'}</Text>
-              </MotionPressable>;
-            })}
-          </View>}
-        </View>
-      </View>
     </View>
     {loading ? <View style={styles.state}><ActivityIndicator color={COLORS.primary} /><Text style={styles.stateText}>Loading events...</Text></View> : <>
       {liveUpdateError && <View style={styles.refreshError}><Text style={styles.stateText}>Live attendance updates are unavailable. Pull down to refresh.</Text></View>}
       {!!loadError && events.length > 0 && <View style={styles.refreshError}><Text style={styles.stateText}>{loadError}</Text><MotionPressable style={styles.clearFilters} onPress={() => load(true)} accessibilityRole="button"><Text style={styles.clearFiltersText}>Try again</Text></MotionPressable></View>}
-      <FlatList data={visibleEvents} keyExtractor={(item) => item.id} contentContainerStyle={styles.list} refreshControl={<RefreshControl refreshing={refreshing} onRefresh={() => load(true)} tintColor={COLORS.primary} />} ListEmptyComponent={<View style={styles.emptyCard}><Text style={styles.stateTitle}>{loadError ? 'Could not load events' : events.length ? 'No matching events' : 'No events available'}</Text><Text style={styles.stateText}>{loadError ?? (events.length ? 'Try another search or filter.' : 'Check back later for upcoming school events.')}</Text>{loadError ? <MotionPressable style={styles.clearFilters} onPress={() => load()} accessibilityRole="button"><Text style={styles.clearFiltersText}>Try again</Text></MotionPressable> : (search || filter !== 'all') && <MotionPressable style={styles.clearFilters} onPress={() => { setSearch(''); setFilter('all'); }} accessibilityRole="button"><Text style={styles.clearFiltersText}>Clear search and filters</Text></MotionPressable>}</View>} renderItem={({ item }) => <EventCard event={item} onPress={() => setSelected(item)} />}
+      <FlatList data={visibleEvents} keyExtractor={(item) => item.id} contentContainerStyle={styles.list} refreshControl={<RefreshControl refreshing={refreshing} onRefresh={() => load(true)} tintColor={COLORS.primary} />} ListEmptyComponent={<View style={styles.emptyCard}><Text style={styles.stateTitle}>{loadError ? 'Could not load events' : events.length ? 'No matching events' : 'No events available'}</Text><Text style={styles.stateText}>{loadError ?? (events.length ? 'Try another search or filter.' : 'Check back later for upcoming school events.')}</Text>{loadError ? <MotionPressable style={styles.clearFilters} onPress={() => load()} accessibilityRole="button"><Text style={styles.clearFiltersText}>Try again</Text></MotionPressable> : (search || filter !== 'all') && <MotionPressable style={styles.clearFilters} onPress={() => { setSearch(''); setFilter('all'); }} accessibilityRole="button"><Text style={styles.clearFiltersText}>Clear search and filters</Text></MotionPressable>}</View>} renderItem={({ item }) => <EventCard event={item} creatorName={role === 'admin' ? eventCreatorNames[item.created_by ?? ''] ?? 'Creator unavailable' : undefined} onPress={() => setSelected(item)} />}
       />
     </>}
     <Modal visible={!!selected} animationType="slide" onRequestClose={() => setSelected(null)}>
@@ -197,6 +241,12 @@ export default function HomeScreen() {
         <View style={styles.modalDetails}>
           <View style={styles.modalDetailRow}><Ionicons name="time-outline" size={17} color={COLORS.textSecondary} /><Text style={styles.detailRowText}>{formatEventTime(selected)}</Text></View>
           {selected.venue && <View style={styles.modalDetailRow}><Ionicons name="location-outline" size={17} color={COLORS.textSecondary} /><Text style={styles.detailRowText}>Venue · {selected.venue}</Text></View>}
+          {role === 'admin' && (
+            <View style={styles.modalDetailRow}>
+              <Ionicons name="person-outline" size={17} color={COLORS.textSecondary} />
+              <Text style={styles.detailRowText}>Created by {eventCreatorNames[selected.created_by ?? ''] ?? 'Creator unavailable'}</Text>
+            </View>
+          )}
         </View>
         {selected.description && <Text style={[styles.description, styles.modalDescription]}>{selected.description}</Text>}
         <View style={styles.modalStatusRow}>
@@ -215,15 +265,16 @@ export default function HomeScreen() {
   </View>;
 }
 
-function EventCard({ event, onPress }: { event: DiscoveryEvent; onPress: () => void }) {
+function EventCard({ event, creatorName, onPress }: { event: DiscoveryEvent; creatorName?: string; onPress: () => void }) {
   const isOpen = event.status === 'open';
   const eventDate = formatEventDate(event.start_time);
   return (
-    <MotionPressable style={({ pressed }) => [styles.card, pressed && styles.cardPressed]} onPress={onPress} accessibilityRole="button" accessibilityLabel={`${event.title}, ${isOpen ? 'open' : 'closed'}`}>
+    <MotionPressable style={({ pressed }) => [styles.card, pressed && styles.cardPressed]} onPress={onPress} accessibilityRole="button" accessibilityLabel={`${event.title}, ${isOpen ? 'open' : 'closed'}${creatorName ? `, created by ${creatorName}` : ''}`}>
       <View style={styles.cardTop}>
         <View style={styles.cardHeading}>
           <Text style={styles.cardTitle} numberOfLines={2}>{event.title}</Text>
           <Text style={styles.code}>{event.event_code}</Text>
+          {creatorName && <Text style={styles.creatorName} numberOfLines={1}>Created by {creatorName}</Text>}
         </View>
         <StatusBadge status={event.status} shape="subtle" />
       </View>
@@ -283,35 +334,36 @@ const styles = StyleSheet.create({
   subtitle: { color: COLORS.textSecondary, fontSize: 14, fontFamily: FONTS.regular, marginTop: 5, lineHeight: 20 },
   controls: { paddingHorizontal: 22, paddingBottom: 2 },
   controlsMenuOpen: { position: 'relative', zIndex: 20, elevation: 20 },
-  searchBox: { minHeight: 46, flexDirection: 'row', alignItems: 'center', backgroundColor: COLORS.card, borderColor: COLORS.border, borderWidth: 1, borderRadius: 10, paddingHorizontal: 13 },
-  searchInput: { flex: 1, color: COLORS.textPrimary, paddingVertical: 10, marginLeft: 9, fontSize: 14, fontFamily: FONTS.regular },
-  filterScroll: { marginTop: 12, flexGrow: 0 },
-  filterGroup: { flexDirection: 'row', alignItems: 'center', gap: 9, paddingRight: 2 },
+  searchBox: { minHeight: 52, flexDirection: 'row', alignItems: 'center', backgroundColor: COLORS.card, borderColor: COLORS.border, borderWidth: 1, borderRadius: 10, paddingLeft: 15, paddingRight: 10, zIndex: 2 },
+  searchBoxMenuOpen: { zIndex: 10, elevation: 10 },
+  searchIcon: { marginRight: 12 },
+  searchInput: { flex: 1, minWidth: 0, color: COLORS.textPrimary, paddingVertical: 12, fontSize: 14, fontFamily: FONTS.regular },
+  searchClearButton: { width: 38, height: 42, alignItems: 'center', justifyContent: 'center', marginLeft: 8 },
+  filterScroll: { marginTop: 14, marginBottom: 8, flexGrow: 0 },
+  filterGroup: { flexDirection: 'row', alignItems: 'center', gap: 11, paddingRight: 2 },
   filter: { minHeight: 40, flexShrink: 0, justifyContent: 'center', borderWidth: 1, borderColor: COLORS.border, borderRadius: 10, paddingHorizontal: 14, backgroundColor: COLORS.card },
   filterActive: { backgroundColor: COLORS.primaryButtonStart, borderColor: COLORS.primaryButtonStart },
   filterPressed: { opacity: 0.76 },
   filterText: { color: COLORS.textSecondary, fontSize: 13, fontWeight: '600', fontFamily: FONTS.semiBold },
   filterTextActive: { color: COLORS.textOnPrimary },
-  sortRow: { flexDirection: 'row', alignItems: 'center', justifyContent: 'space-between', minHeight: 40, marginTop: 14, marginBottom: 8 },
-  sortRowOpen: { zIndex: 10, elevation: 10 },
-  sortByLabel: { color: COLORS.textMuted, fontSize: 13, fontFamily: FONTS.medium },
-  sortControlWrap: { position: 'relative', alignItems: 'flex-end', flexShrink: 0 },
+  sortControlWrap: { position: 'relative', flexShrink: 0, marginLeft: 12, paddingLeft: 12, borderLeftWidth: 1, borderLeftColor: COLORS.border, zIndex: 3 },
   sortControlOpen: { zIndex: 11, elevation: 11 },
-  sortDropdown: { minHeight: 40, flexDirection: 'row', alignItems: 'center', justifyContent: 'center', gap: 7, paddingHorizontal: 8 },
-  sortDropdownPressed: { opacity: 0.72 },
-  sortLabel: { color: COLORS.textSecondary, fontSize: 13, fontWeight: '600', fontFamily: FONTS.semiBold },
-  sortMenu: { position: 'absolute', top: 44, right: 0, minWidth: 116, padding: 4, borderWidth: 1, borderColor: COLORS.border, borderRadius: 10, backgroundColor: COLORS.card, zIndex: 12, elevation: 12 },
-  sortOption: { minHeight: 38, justifyContent: 'center', borderRadius: 5, paddingHorizontal: 10 },
-  sortOptionSelected: { backgroundColor: `${COLORS.primary}18` },
-  sortOptionText: { color: COLORS.textSecondary, fontSize: 12, fontFamily: FONTS.medium },
-  sortOptionTextSelected: { color: COLORS.primary, fontFamily: FONTS.semiBold },
-  list: { paddingHorizontal: 22, paddingTop: 2, paddingBottom: 30 },
-  card: { backgroundColor: COLORS.card, borderColor: COLORS.border, borderWidth: 1, borderRadius: 11, padding: 13, marginBottom: 9, overflow: 'hidden' },
+  sortDropdown: { width: 42, height: 42, alignItems: 'center', justifyContent: 'center', borderRadius: 8 },
+  sortDropdownPressed: { opacity: 0.78, backgroundColor: COLORS.surfaceRaised },
+  sortMenu: { position: 'absolute', top: 43, right: -5, width: 148, padding: 5, borderWidth: 1, borderColor: COLORS.border, borderRadius: 10, backgroundColor: COLORS.card, zIndex: 12, elevation: 12, shadowColor: COLORS.shadow, shadowOffset: { width: 0, height: 6 }, shadowOpacity: 0.28, shadowRadius: 12 },
+  sortOption: { minHeight: 40, flexDirection: 'row', alignItems: 'center', justifyContent: 'space-between', gap: 8, borderRadius: 7, paddingHorizontal: 10 },
+  sortOptionSelected: { backgroundColor: `${COLORS.primary}24` },
+  sortOptionPressed: { backgroundColor: COLORS.surfaceRaised },
+  sortOptionText: { color: COLORS.textSecondary, fontSize: 13, fontFamily: FONTS.medium },
+  sortOptionTextSelected: { color: COLORS.primaryLight, fontFamily: FONTS.semiBold },
+  list: { paddingHorizontal: 22, paddingTop: 8, paddingBottom: 30 },
+  card: { backgroundColor: COLORS.card, borderColor: COLORS.border, borderWidth: 1, borderRadius: 11, padding: 14, marginBottom: 14, overflow: 'hidden' },
   cardPressed: { opacity: 0.88 },
   cardTop: { flexDirection: 'row', alignItems: 'flex-start', gap: 10 },
   cardHeading: { flex: 1, minWidth: 0, gap: 3 },
   cardTitle: { color: COLORS.textPrimary, fontSize: 16, lineHeight: 21, fontWeight: '700', fontFamily: FONTS.bold, letterSpacing: -0.15 },
   code: { color: COLORS.primary, fontSize: 12, lineHeight: 16, fontWeight: '600', fontFamily: FONTS.semiBold, letterSpacing: 0.2 },
+  creatorName: { color: COLORS.textSecondary, fontSize: 11, lineHeight: 15, fontFamily: FONTS.regular, marginTop: 2 },
   cardDivider: { height: 1, backgroundColor: COLORS.border, marginVertical: 10 },
   detailRow: { flexDirection: 'row', alignItems: 'center', gap: 8, marginTop: 5 },
   detail: { color: COLORS.textSecondary, fontSize: 12, fontFamily: FONTS.regular, lineHeight: 17, flexShrink: 1 },

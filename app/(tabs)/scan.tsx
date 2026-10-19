@@ -35,7 +35,7 @@ export default function ScanScreen() {
     setScanned(true);
     setProcessing(true);
     try {
-      const result = await registerAttendance(data, user?.id);
+      const result = await registerAttendance(data);
       setMessage(result.message);
       setSuccess(result.success);
     } catch (error) {

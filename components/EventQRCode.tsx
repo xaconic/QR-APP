@@ -4,6 +4,7 @@ import { ActivityIndicator, AppState, StyleSheet, Text, View } from 'react-nativ
 
 import { COLORS } from '@/constants/colors';
 import { FONTS } from '@/constants/fonts';
+import { useAuth } from '@/lib/auth';
 import { getRotatingCheckinToken } from '@/lib/attendance';
 import { buildQRPayload } from '@/lib/qr';
 
@@ -15,6 +16,7 @@ type Props = {
 const TOKEN_REFRESH_MS = 15_000;
 
 export default function EventQRCode({ event, compact = false }: Props) {
+  const { session } = useAuth();
   const [token, setToken] = useState<string | null>(null);
   const [expiresAt, setExpiresAt] = useState<number | null>(null);
   const [now, setNow] = useState(Date.now());
@@ -26,7 +28,7 @@ export default function EventQRCode({ event, compact = false }: Props) {
     const refreshToken = async () => {
       if (requestInProgress) return;
       requestInProgress = true;
-      const result = await getRotatingCheckinToken(event.id);
+      const result = await getRotatingCheckinToken(event.id, session);
       requestInProgress = false;
       if (!active) return;
       if (result.error || !result.token || !result.expiresAt) {
@@ -51,7 +53,7 @@ export default function EventQRCode({ event, compact = false }: Props) {
       clearInterval(clockTimer);
       appStateSubscription.remove();
     };
-  }, [event.id]);
+  }, [event.id, session]);
 
   const isExpired = !expiresAt || expiresAt <= now;
   const remainingSeconds = expiresAt ? Math.max(0, Math.ceil((expiresAt - now) / 1000)) : 0;
@@ -67,22 +69,22 @@ export default function EventQRCode({ event, compact = false }: Props) {
             ? <Text style={styles.error}>{error}</Text>
             : <ActivityIndicator color={COLORS.primary} />}
         </View>}
-    <Text style={styles.hint}>
+    <Text style={styles.hint} accessibilityLiveRegion="polite">
       {payload
-        ? `Live check-in code · refreshes every 15 seconds · expires in ${remainingSeconds}s`
-        : error ?? 'Loading live check-in code...'}
+        ? `Refreshes every 15s · ${remainingSeconds}s remaining`
+        : error ?? 'Loading your live check-in QR...'}
     </Text>
-    <Text style={styles.warning}>Keep this screen visible. Older screenshots expire; live forwarding may still be possible.</Text>
+    <Text style={styles.warning}>Keep this screen open during check-in. Screenshots expire, but live sharing may still work.</Text>
   </View>;
 }
 
 const styles = StyleSheet.create({
-  container: { alignItems: 'center', marginTop: 12 },
-  compactContainer: { marginTop: 14, width: '100%' },
+  container: { alignItems: 'center', marginTop: 10, gap: 6 },
+  compactContainer: { marginTop: 12, width: '100%' },
   qrBox: { backgroundColor: '#FFF', padding: 12, borderRadius: 12 },
   compactQrBox: { padding: 9, borderRadius: 14 },
   qrPlaceholder: { backgroundColor: '#FFF', padding: 12, borderRadius: 12, width: 234, height: 234, alignItems: 'center', justifyContent: 'center' },
-  hint: { color: COLORS.textSecondary, textAlign: 'center', fontSize: 12, fontFamily: FONTS.regular, lineHeight: 17, marginTop: 12 },
-  warning: { color: COLORS.textMuted, textAlign: 'center', fontSize: 11, fontFamily: FONTS.regular, lineHeight: 16, marginTop: 5 },
+  hint: { color: COLORS.textSecondary, textAlign: 'center', fontSize: 12, fontFamily: FONTS.medium, lineHeight: 17 },
+  warning: { color: COLORS.textMuted, textAlign: 'center', fontSize: 11, fontFamily: FONTS.regular, lineHeight: 15 },
   error: { color: COLORS.danger, textAlign: 'center', fontSize: 13, fontFamily: FONTS.medium },
 });

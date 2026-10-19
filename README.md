@@ -78,6 +78,39 @@ remain visible in history but are not treated as finalized absences. A
 successful in-app check-in notifies the mounted history screen to reload its
 student-scoped records and refresh the dashboard immediately.
 
+Migration `20261058000000_enable_app_data_realtime.sql` adds the app's
+user-facing event, attendance, profile, eligibility, and academic catalog
+tables to Supabase Realtime. The app treats these notifications as cache
+invalidations and reloads authoritative records through its existing
+authorized queries. Apply this migration to each Supabase project for live
+cross-device updates; focused screens also reload on open and reconnect.
+
+Migration `20261059000000_align_attendance_export_with_roster.sql` limits
+administrator and teacher attendance exports to active students in the event's
+current eligible roster. The attendance manager also derives its matching
+record count from the roster summary it already loaded, avoiding a second
+network request for the count.
+
+Migration `20261060000000_allow_own_profile_name_update_rpc.sql` lets an
+authenticated user, including an administrator, update only their own profile
+name through a narrowly scoped database function. Apply it to each Supabase
+project before using the matching app version.
+
+Migration `20261061000000_add_teacher_signup_requests.sql` adds Student and
+Teacher choices during registration. Teacher applicants remain student-role
+accounts until an administrator approves their pending request in Registered
+Users. Apply it before deploying the matching app version.
+
+Migration `20261062000000_include_late_time_in_student_history.sql` includes
+the event's late cutoff in student attendance history, so students can see
+when check-ins begin counting as late. Apply it before deploying the matching
+app version.
+
+Permanent user deletion from the administrator dashboard requires
+`20261050000000_add_admin_user_deletion.sql` to be applied to the Supabase
+project. It uses an admin-authorized database function and cannot delete the
+currently signed-in administrator or the last active administrator.
+
 The project’s complete database state is the bootstrap schema plus all
 migrations. Keep the schema bootstrap and migration chain under review together
 when changing policies or RPCs.

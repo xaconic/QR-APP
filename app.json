@@ -2,7 +2,7 @@
   "expo": {
     "name": "Acadence",
     "slug": "QR-ATT",
-    "version": "1.0.0",
+    "version": "2.0.0",
     "orientation": "portrait",
     "icon": "./assets/images/android-icon-monochrome.png",
     "scheme": "qr-attendance",
@@ -46,10 +46,13 @@
       [
         "expo-splash-screen",
         {
-          "image": "./assets/images/splash-branding.png",
-          "imageWidth": 150,
-          "resizeMode": "contain",
-          "backgroundColor": "#07142B"
+          "backgroundColor": "#07142B",
+          "android": {
+            "backgroundColor": "#07142B",
+            "drawable": {
+              "icon": "./assets/images/splash-transparent.xml"
+            }
+          }
         }
       ],
       "@react-native-community/datetimepicker",

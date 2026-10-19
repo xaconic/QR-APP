@@ -1,7 +1,7 @@
 import { useState, useEffect } from 'react';
-import { Platform } from 'react-native';
+import { AppState, Platform } from 'react-native';
 import * as Linking from 'expo-linking';
-import { setSessionPersistence, supabase, supabaseSignUpClient } from './supabase';
+import { setLatestAuthSession, setSessionPersistence, supabase, supabaseSignUpClient } from './supabase';
 import type { Session, User } from '@supabase/supabase-js';
 
 type AuthState = {
@@ -25,6 +25,7 @@ export function setAuth(session: Session | null) {
   globalSession = session;
   globalUser = session?.user ?? null;
   globalLoading = false;
+  setLatestAuthSession(session);
   notify();
 }
 
@@ -39,6 +40,15 @@ export function initializeAuth() {
     receivedAuthEvent = true;
     setAuth(session);
   });
+  const appStateSubscription = Platform.OS === 'web'
+    ? null
+    : AppState.addEventListener('change', (state) => {
+      if (state === 'active') void supabase.auth.startAutoRefresh();
+      else void supabase.auth.stopAutoRefresh();
+    });
+  if (Platform.OS !== 'web' && AppState.currentState === 'active') {
+    void supabase.auth.startAutoRefresh();
+  }
 
   const restoreTimeout = setTimeout(() => {
     if (initializationId !== authInitializationId || !globalLoading) return;
@@ -67,6 +77,8 @@ export function initializeAuth() {
     if (initializationId === authInitializationId) authInitializationId += 1;
     clearTimeout(restoreTimeout);
     subscription.unsubscribe();
+    appStateSubscription?.remove();
+    if (Platform.OS !== 'web') void supabase.auth.stopAutoRefresh();
   };
 }
 
@@ -89,10 +101,11 @@ export function useAuth(): AuthState {
 
 export type SignUpProfile = {
   full_name: string;
-  academic_level_id: string;
-  course_id: string;
-  year_level_id: string;
-  section_id: string;
+  role: 'student' | 'teacher';
+  academic_level_id?: string;
+  course_id?: string;
+  year_level_id?: string;
+  section_id?: string;
 };
 
 export async function signUp(
@@ -106,7 +119,7 @@ export async function signUp(
     options: {
       data: profile ? {
         full_name: profile.full_name,
-        role: 'student',
+        role: profile.role,
         academic_level_id: profile.academic_level_id,
         course_id: profile.course_id,
         year_level_id: profile.year_level_id,

@@ -1,4 +1,6 @@
-import { supabase } from './supabase';
+import { getFreshAccessToken, supabase } from './supabase';
+import type { Session } from '@supabase/supabase-js';
+import { normalizeEventAttendanceSummary } from './attendanceSummary';
 
 export type AdminUser = {
   id: string;
@@ -9,6 +11,7 @@ export type AdminUser = {
   created_at: string;
   is_active: boolean;
   deactivated_at: string | null;
+  teacher_requested_at: string | null;
   course_id: string | null;
   academic_level_id: string | null;
   year_level_id: string | null;
@@ -39,6 +42,7 @@ export type AdminEvent = {
 export type AdminAttendanceSummary = {
   eventId: string;
   eventTitle: string;
+  totalStudents: number;
   attendeeCount: number;
   lateCount: number;
   absentCount: number;
@@ -74,22 +78,46 @@ export type AdminDashboardData = {
   sections: AdminSection[];
 };
 
-export async function getAdminDashboardData(): Promise<{
+export async function getAdminDashboardData(fallbackSession?: Session | null): Promise<{
   data: AdminDashboardData | null;
   error: string | null;
 }> {
+  let accessToken: string;
+  try {
+    accessToken = await getFreshAccessToken(fallbackSession);
+  } catch (error) {
+    return {
+      data: null,
+      error: error instanceof Error ? error.message : 'Your session could not be refreshed.',
+    };
+  }
+  const authorizationRequest = supabase.rpc('is_admin');
+  authorizationRequest.setHeader('Authorization', `Bearer ${accessToken}`);
+  const { data: isAdmin, error: authorizationError } = await authorizationRequest;
+  if (authorizationError) return { data: null, error: `Administrator access could not be verified: ${authorizationError.message}` };
+  if (isAdmin !== true) return { data: null, error: 'This signed-in account is not an active administrator in Supabase.' };
+
+  const usersRequest = supabase
+    .from('profiles')
+    .select('id, display_id, email, full_name, role, created_at, is_active, deactivated_at, teacher_requested_at, academic_level_id, course_id, year_level_id, section_id')
+    .order('created_at', { ascending: false });
+  const eventsRequest = supabase
+    .from('events')
+    .select('id, event_code, title, start_time, end_time, created_by, created_at, status, event_status, venue, description, archived_at, audience_mode')
+    .order('created_at', { ascending: false });
+  const coursesRequest = supabase.from('courses').select('id, code, name, academic_level_id').eq('is_active', true);
+  const yearsRequest = supabase.from('year_levels').select('id, name, sort_order').eq('is_active', true);
+  const sectionsRequest = supabase.from('academic_sections').select('id, course_id, year_level_id, section_name, section_code, academic_year').eq('is_active', true);
+  for (const request of [usersRequest, eventsRequest, coursesRequest, yearsRequest, sectionsRequest]) {
+    request.setHeader('Authorization', `Bearer ${accessToken}`);
+  }
+
   const [usersResult, eventsResult, coursesResult, yearsResult, sectionsResult] = await Promise.all([
-    supabase
-      .from('profiles')
-      .select('id, display_id, email, full_name, role, created_at, is_active, deactivated_at, academic_level_id, course_id, year_level_id, section_id')
-      .order('created_at', { ascending: false }),
-    supabase
-      .from('events')
-      .select('id, event_code, title, start_time, end_time, created_by, created_at, status, event_status, venue, description, archived_at, audience_mode')
-      .order('created_at', { ascending: false }),
-    supabase.from('courses').select('id, code, name, academic_level_id').eq('is_active', true),
-    supabase.from('year_levels').select('id, name').eq('is_active', true),
-    supabase.from('academic_sections').select('id, course_id, year_level_id, section_name, section_code, academic_year').eq('is_active', true),
+    usersRequest,
+    eventsRequest,
+    coursesRequest,
+    yearsRequest,
+    sectionsRequest,
   ]);
 
   const error = usersResult.error ?? eventsResult.error ?? coursesResult.error ?? yearsResult.error ?? sectionsResult.error;
@@ -122,40 +150,50 @@ export async function getAdminDashboardData(): Promise<{
   await Promise.all(
     ((eventsResult.data ?? []) as { id: string; end_time?: string | null }[])
       .filter((event) => event.end_time && new Date(event.end_time).getTime() <= Date.now())
-      .map((event) => supabase.rpc('finalize_event_attendance', { p_event_id: event.id }))
+      .map((event) => {
+        const request = supabase.rpc('finalize_event_attendance', { p_event_id: event.id });
+        request.setHeader('Authorization', `Bearer ${accessToken}`);
+        return request;
+      })
   );
 
-  const attendanceResult = await supabase
-    .from('attendance')
-    .select('event_id, status, events ( title )')
-    .order('scanned_at', { ascending: false });
-  if (attendanceResult.error) return { data: null, error: attendanceResult.error.message };
+  const attendanceResults = await Promise.all(
+    (eventsResult.data ?? []).map(async (event) => {
+      const request = supabase.rpc('get_event_attendance_summary', {
+        p_event_id: event.id,
+        p_course_id: null,
+        p_year_level_id: null,
+        p_section_id: null,
+        p_status: null,
+      });
+      request.setHeader('Authorization', `Bearer ${accessToken}`);
+      const { data, error } = await request;
+      if (error) return { event, summary: null, error: error.message };
 
-  const counts: Record<string, AdminAttendanceSummary> = {};
-  for (const row of (attendanceResult.data ?? []) as any[]) {
-    if (row.status !== 'present' && row.status !== 'late' && row.status !== 'absent') continue;
-    const eventId = row.event_id as string;
-    if (!counts[eventId]) {
-      counts[eventId] = {
-        eventId,
-        eventTitle: row.events?.title ?? 'Unknown event',
-        attendeeCount: 0,
-        lateCount: 0,
-        absentCount: 0,
-      };
-    }
-    if (row.status === 'absent') counts[eventId].absentCount += 1;
-    else {
-      counts[eventId].attendeeCount += 1;
-      if (row.status === 'late') counts[eventId].lateCount += 1;
-    }
-  }
+      const summary = normalizeEventAttendanceSummary(data);
+      if (!summary) return { event, summary: null, error: 'The attendance summary returned an invalid response.' };
+      return { event, summary, error: null };
+    }),
+  );
+  const attendanceError = attendanceResults.find((result) => result.error)?.error;
+  if (attendanceError) return { data: null, error: attendanceError };
+  const attendance: AdminAttendanceSummary[] = attendanceResults.flatMap(({ event, summary }) => {
+    if (!summary || summary.total === 0) return [];
+    return [{
+      eventId: event.id,
+      eventTitle: event.title,
+      totalStudents: summary.total,
+      attendeeCount: summary.present + summary.late,
+      lateCount: summary.late,
+      absentCount: summary.absent,
+    }];
+  });
 
   return {
     data: {
       users,
       events: (eventsResult.data ?? []) as AdminEvent[],
-      attendance: Object.values(counts),
+      attendance,
       courses: (coursesResult.data ?? []) as AdminCourse[],
       yearLevels: (yearsResult.data ?? []) as AdminYearLevel[],
       sections: (sectionsResult.data ?? []) as AdminSection[],
@@ -175,8 +213,20 @@ export async function updateAdminUser(
   return { error: error?.message ?? null };
 }
 
-export async function approveTeacher(userId: string): Promise<{ error: string | null }> {
-  const { error } = await supabase.rpc('admin_approve_teacher', { p_user_id: userId });
+export async function approveTeacher(
+  userId: string,
+  fallbackSession?: Session | null,
+): Promise<{ error: string | null }> {
+  let accessToken: string;
+  try {
+    accessToken = await getFreshAccessToken(fallbackSession);
+  } catch (error) {
+    return { error: error instanceof Error ? error.message : 'Your session could not be refreshed.' };
+  }
+
+  const request = supabase.rpc('admin_approve_teacher', { p_user_id: userId });
+  request.setHeader('Authorization', `Bearer ${accessToken}`);
+  const { error } = await request;
   return { error: error?.message ?? null };
 }
 
@@ -190,7 +240,27 @@ export async function reactivateAdminUser(userId: string): Promise<{ error: stri
   return { error: error?.message ?? null };
 }
 
-export async function deleteAdminUser(userId: string): Promise<{ error: string | null }> {
-  const { error } = await supabase.rpc('admin_delete_user', { p_user_id: userId });
-  return { error: error?.message ?? null };
+export async function deleteAdminUser(
+  userId: string,
+  fallbackSession?: Session | null,
+): Promise<{ error: string | null }> {
+  let accessToken: string;
+  try {
+    accessToken = await getFreshAccessToken(fallbackSession);
+  } catch (error) {
+    return { error: error instanceof Error ? error.message : 'Your session could not be refreshed.' };
+  }
+
+  const request = supabase.rpc('admin_delete_user', { p_user_id: userId });
+  request.setHeader('Authorization', `Bearer ${accessToken}`);
+  const { error } = await request;
+  if (!error) return { error: null };
+
+  const message = error.message.toLowerCase();
+  if (message.includes('could not find the function') && message.includes('admin_delete_user')) {
+    return {
+      error: 'Permanent user deletion is not enabled in this Supabase project yet. Apply migration 20261050000000_add_admin_user_deletion.sql, then retry.',
+    };
+  }
+  return { error: error.message };
 }

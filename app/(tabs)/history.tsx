@@ -3,6 +3,14 @@ import { useCallback, useEffect, useMemo, useRef, useState, type ComponentProps 
 import { ActivityIndicator, Animated, Easing, FlatList, Modal, Platform, RefreshControl, ScrollView, StyleSheet, Text, TextInput, View } from 'react-native';
 import MotionPressable from '@/components/MotionPressable';
 import Ionicons from '@expo/vector-icons/Ionicons';
+import {
+  CalendarDays,
+  ChartNoAxesCombined,
+  ChevronDown,
+  ChevronUp,
+  CircleX,
+  Flame,
+} from 'lucide-react-native';
 import { useSafeAreaInsets } from 'react-native-safe-area-context';
 import StatusBadge from '@/components/StatusBadge';
 
@@ -19,18 +27,23 @@ import {
   type TeacherEventSummary,
 } from '@/lib/attendance';
 import { subscribeToAttendanceHistoryUpdates } from '@/lib/attendanceHistoryEvents';
+import { subscribeToSupabaseDataChanges } from '@/lib/supabaseRealtime';
 import {
   calculateStudentAttendanceStats,
   isInCurrentManilaMonth,
 } from '@/lib/studentAttendanceStats';
 
 type HistoryStatusFilter = 'all' | 'present' | 'late' | 'absent' | 'excused';
+type EventHistorySort = 'latest' | 'oldest' | 'name';
 
 type AttendanceReportEvent = TeacherEventSummary & {
   attendanceFinalized: boolean;
   summary: EventAttendanceSummary | null;
+  creatorName?: string;
   countError?: string;
 };
+
+let attendanceInsightsExpanded = false;
 
 function isAttendanceFinalized(event: TeacherEventSummary) {
   if (event.eventStatus === 'completed') return true;
@@ -39,11 +52,14 @@ function isAttendanceFinalized(event: TeacherEventSummary) {
   return Number.isFinite(endTime) && endTime <= Date.now();
 }
 
-async function addAttendanceSummaries(events: TeacherEventSummary[]): Promise<AttendanceReportEvent[]> {
+async function addAttendanceSummaries<T extends TeacherEventSummary>(
+  events: T[],
+  session: ReturnType<typeof useAuth>['session'],
+): Promise<Array<T & AttendanceReportEvent>> {
   return Promise.all(events.map(async (event) => {
     const shouldFinalize = isAttendanceFinalized(event);
     try {
-      const result = await getEventAttendanceSummary(event.eventId, { attendanceFinalized: shouldFinalize });
+      const result = await getEventAttendanceSummary(event.eventId, { attendanceFinalized: shouldFinalize }, session);
       const attendanceFinalized = event.eventStatus === 'completed' || (shouldFinalize && !result.error);
       if (result.error || !result.data) {
         return { ...event, attendanceFinalized, status: attendanceFinalized ? 'closed' : event.status, summary: null, countError: result.error ?? 'Attendance summary is unavailable.' };
@@ -74,6 +90,7 @@ export default function HistoryScreen() {
   const [refreshing, setRefreshing] = useState(false);
   const [historyError, setHistoryError] = useState<string | null>(null);
   const [historySearch, setHistorySearch] = useState('');
+  const [eventHistorySort, setEventHistorySort] = useState<EventHistorySort>('latest');
   const [statusFilter, setStatusFilter] = useState<HistoryStatusFilter>('all');
   const [currentMonthOnly, setCurrentMonthOnly] = useState(false);
   const [selectedHistoryRecord, setSelectedHistoryRecord] = useState<AttendanceRecord | null>(null);
@@ -81,6 +98,7 @@ export default function HistoryScreen() {
   const [selectedAttendance, setSelectedAttendance] = useState<EventAttendanceSummary | null>(null);
   const [attendanceLoading, setAttendanceLoading] = useState(false);
   const [attendanceError, setAttendanceError] = useState<string | null>(null);
+  const historyListRef = useRef<FlatList<AttendanceRecord>>(null);
   const attendanceRequestId = useRef(0);
   const attendanceStats = useMemo(() => calculateStudentAttendanceStats(records.map((record) => ({
     eventKey: record.eventUuid || record.eventId || record.id,
@@ -97,6 +115,19 @@ export default function HistoryScreen() {
       && (!search || `${record.eventTitle} ${record.eventId}`.toLocaleLowerCase().includes(search))
     ));
   }, [currentMonthOnly, historySearch, records, statusFilter]);
+  const summarySearch = historySearch.trim().toLocaleLowerCase();
+  const sortedTeacherSummaries = useMemo(
+    () => sortAttendanceEvents(teacherSummaries.filter((event) => (
+      !summarySearch || `${event.title} ${event.eventCode}`.toLocaleLowerCase().includes(summarySearch)
+    )), eventHistorySort),
+    [eventHistorySort, summarySearch, teacherSummaries],
+  );
+  const sortedAdminEventSummaries = useMemo(
+    () => sortAttendanceEvents(adminEventSummaries.filter((event) => (
+      !summarySearch || `${event.title} ${event.eventCode}`.toLocaleLowerCase().includes(summarySearch)
+    )), eventHistorySort),
+    [adminEventSummaries, eventHistorySort, summarySearch],
+  );
 
   const loadAttendanceDetails = useCallback(async (event: TeacherEventSummary, showLoading: boolean) => {
     const requestId = ++attendanceRequestId.current;
@@ -107,7 +138,7 @@ export default function HistoryScreen() {
     }
     try {
       const shouldFinalize = isAttendanceFinalized(event);
-      const result = await getEventAttendanceSummary(event.eventId, { attendanceFinalized: shouldFinalize });
+      const result = await getEventAttendanceSummary(event.eventId, { attendanceFinalized: shouldFinalize }, session);
       const attendanceFinalized = event.eventStatus === 'completed' || (shouldFinalize && !result.error);
       if (requestId !== attendanceRequestId.current) return;
       setSelectedAttendance(result.data);
@@ -141,7 +172,7 @@ export default function HistoryScreen() {
     } finally {
       if (requestId === attendanceRequestId.current) setAttendanceLoading(false);
     }
-  }, []);
+  }, [session]);
 
   const openTeacherEvent = (event: AttendanceReportEvent) => {
     setSelectedTeacherEvent(event);
@@ -166,9 +197,9 @@ export default function HistoryScreen() {
       setRole(currentRole);
 
       if (currentRole === 'teacher') {
-        const summaries = await getTeacherEventSummary(user.id);
+        const summaries = await getTeacherEventSummary(user.id, session);
         setHistoryError(summaries.error);
-        setTeacherSummaries(await addAttendanceSummaries(summaries.data ?? []));
+        setTeacherSummaries(await addAttendanceSummaries(summaries.data ?? [], session));
         setAdminEventSummaries([]);
         setAdminError(null);
         setRecords([]);
@@ -176,23 +207,30 @@ export default function HistoryScreen() {
       }
 
       if (currentRole === 'admin') {
-        const result = await getAdminDashboardData();
-        const summaries: TeacherEventSummary[] = (result.data?.events ?? []).map((event) => ({
-          eventId: event.id,
-          eventCode: event.event_code,
-          title: event.title,
-          status: event.status,
-          eventStatus: event.event_status ?? 'upcoming',
-          endTime: event.end_time,
-        }));
-        setAdminEventSummaries(await addAttendanceSummaries(summaries));
+        const result = await getAdminDashboardData(session);
+        const adminUsers = result.data?.users ?? [];
+        const summaries = (result.data?.events ?? []).map((event) => {
+          const creator = adminUsers.find((profile) => profile.id === event.created_by);
+          return {
+            eventId: event.id,
+            eventCode: event.event_code,
+            title: event.title,
+            status: event.status,
+            eventStatus: event.event_status ?? 'upcoming',
+            endTime: event.end_time,
+            startTime: event.start_time,
+            createdAt: event.created_at,
+            creatorName: creator?.full_name || creator?.email || 'Unknown user',
+          };
+        });
+        setAdminEventSummaries(await addAttendanceSummaries(summaries, session));
         setAdminError(result.error);
         setTeacherSummaries([]);
         setRecords([]);
         return;
       }
 
-      const history = await getAttendanceHistory(user.id, session?.access_token);
+      const history = await getAttendanceHistory(user.id);
       setRecords(history.data ?? []);
       setHistoryError(history.error);
       setTeacherSummaries([]);
@@ -222,8 +260,17 @@ export default function HistoryScreen() {
 
   useFocusEffect(
     useCallback(() => {
-      loadHistory();
-    }, [loadHistory])
+      void loadHistory();
+      let refreshTimer: ReturnType<typeof setTimeout> | undefined;
+      const unsubscribe = subscribeToSupabaseDataChanges(() => {
+        if (refreshTimer) clearTimeout(refreshTimer);
+        refreshTimer = setTimeout(() => { void loadHistory(false); }, 200);
+      });
+      return () => {
+        if (refreshTimer) clearTimeout(refreshTimer);
+        unsubscribe();
+      };
+    }, [loadHistory]),
   );
 
   useEffect(
@@ -247,6 +294,15 @@ export default function HistoryScreen() {
           <Text style={styles.adminSubtitle}>Review attendance for events you manage.</Text>
         </View>
 
+        {!loading && !historyError && teacherSummaries.length > 0 && (
+          <EventHistorySortControl
+            value={eventHistorySort}
+            onChange={setEventHistorySort}
+            search={historySearch}
+            onSearchChange={setHistorySearch}
+          />
+        )}
+
         {loading ? (
           <View style={styles.adminLoading}><ActivityIndicator color={COLORS.primary} /><Text style={styles.adminLoadingText}>Loading events...</Text></View>
         ) : historyError ? (
@@ -266,9 +322,10 @@ export default function HistoryScreen() {
           </View>
         ) : (
           <FlatList
-            data={teacherSummaries}
+            data={sortedTeacherSummaries}
             keyExtractor={(item) => item.eventId}
             contentContainerStyle={styles.adminList}
+            ListEmptyComponent={<View style={styles.adminEmpty}><Text style={styles.adminEmptyTitle}>No matching events</Text><Text style={styles.adminEmptyText}>Try a different event name or code.</Text></View>}
             renderItem={({ item }) => (
               <MotionPressable
                 style={({ pressed }) => [styles.adminEventCard, pressed && styles.adminCardPressed]}
@@ -323,6 +380,15 @@ export default function HistoryScreen() {
           <Text style={styles.adminSubtitle}>Review attendance for every event.</Text>
         </View>
 
+        {!loading && !adminError && adminEventSummaries.length > 0 && (
+          <EventHistorySortControl
+            value={eventHistorySort}
+            onChange={setEventHistorySort}
+            search={historySearch}
+            onSearchChange={setHistorySearch}
+          />
+        )}
+
         {loading ? (
           <View style={styles.adminLoading}><ActivityIndicator color={COLORS.primary} /><Text style={styles.adminLoadingText}>Loading events...</Text></View>
         ) : adminError ? (
@@ -334,9 +400,10 @@ export default function HistoryScreen() {
           </View>
         ) : (
           <FlatList
-            data={adminEventSummaries}
+            data={sortedAdminEventSummaries}
             keyExtractor={(item) => item.eventId}
             contentContainerStyle={styles.adminList}
+            ListEmptyComponent={<View style={styles.adminEmpty}><Text style={styles.adminEmptyTitle}>No matching events</Text><Text style={styles.adminEmptyText}>Try a different event name or code.</Text></View>}
             renderItem={({ item }) => (
               <MotionPressable
                 style={({ pressed }) => [styles.adminEventCard, pressed && styles.adminCardPressed]}
@@ -349,6 +416,9 @@ export default function HistoryScreen() {
                   <View style={styles.adminEventInfo}>
                     <Text style={styles.adminEventTitle} numberOfLines={2}>{item.title}</Text>
                     <Text style={styles.adminEventCode}>{item.eventCode}</Text>
+                    {item.creatorName && (
+                      <Text style={styles.adminEventCreator} numberOfLines={1}>Created by {item.creatorName}</Text>
+                    )}
                   </View>
                   <StatusBadge status={item.status} />
                 </View>
@@ -408,6 +478,7 @@ export default function HistoryScreen() {
         </View>
       ) : (
         <FlatList
+          ref={historyListRef}
           data={visibleHistoryRecords}
           keyExtractor={(item) => String(item.id)}
           contentContainerStyle={styles.historyList}
@@ -419,7 +490,22 @@ export default function HistoryScreen() {
                 <Text style={styles.historyTitle}>Attendance History</Text>
                 <Text style={styles.historySubtitle}>Track your attendance, review past events, and monitor your progress.</Text>
               </View>
-              <StudentAttendanceOverview stats={attendanceStats} />
+              <StudentAttendanceOverview
+                stats={attendanceStats}
+                selectedFilter={statusFilter}
+                onMetricPress={(filter) => {
+                  setStatusFilter(filter);
+                  setCurrentMonthOnly(false);
+                  setHistorySearch('');
+                  if (records.some((record) => filter === 'all' || record.status === filter)) {
+                    requestAnimationFrame(() => historyListRef.current?.scrollToIndex({
+                      index: 0,
+                      animated: true,
+                      viewPosition: 0,
+                    }));
+                  }
+                }}
+              />
               <View style={styles.historySearchBox}>
                 <Ionicons name="search-outline" size={18} color={COLORS.textMuted} />
                 <TextInput
@@ -498,6 +584,113 @@ export default function HistoryScreen() {
   );
 }
 
+function sortAttendanceEvents(events: AttendanceReportEvent[], sort: EventHistorySort) {
+  return [...events].sort((left, right) => {
+    if (sort === 'name') {
+      return left.title.localeCompare(right.title) || left.eventCode.localeCompare(right.eventCode);
+    }
+
+    const timestamp = (event: AttendanceReportEvent) => {
+      const start = Date.parse(event.startTime ?? '');
+      if (Number.isFinite(start)) return start;
+      const created = Date.parse(event.createdAt ?? '');
+      return Number.isFinite(created) ? created : null;
+    };
+    const leftDate = timestamp(left);
+    const rightDate = timestamp(right);
+    if (leftDate === null || rightDate === null) {
+      if (leftDate === null && rightDate !== null) return 1;
+      if (rightDate === null && leftDate !== null) return -1;
+      return left.title.localeCompare(right.title);
+    }
+    return sort === 'latest' ? rightDate - leftDate : leftDate - rightDate;
+  });
+}
+
+function EventHistorySortControl({
+  value,
+  onChange,
+  search,
+  onSearchChange,
+}: {
+  value: EventHistorySort;
+  onChange: (sort: EventHistorySort) => void;
+  search: string;
+  onSearchChange: (search: string) => void;
+}) {
+  const [open, setOpen] = useState(false);
+  const labels: Record<EventHistorySort, string> = {
+    latest: 'Newest first',
+    oldest: 'Oldest first',
+    name: 'Name (A-Z)',
+  };
+
+  return (
+    <View style={[styles.eventHistorySearchBox, open && styles.eventHistorySearchOpen]}>
+      <Ionicons name="search-outline" size={18} color={COLORS.textMuted} style={styles.eventHistorySearchIcon} />
+      <TextInput
+        style={styles.eventHistorySearchInput}
+        value={search}
+        onChangeText={onSearchChange}
+        placeholder="Search events"
+        placeholderTextColor={COLORS.textMuted}
+        returnKeyType="search"
+        accessibilityLabel="Search events by name or code"
+      />
+      {search.length > 0 && (
+        <MotionPressable
+          style={styles.eventHistorySearchClear}
+          onPress={() => onSearchChange('')}
+          accessibilityRole="button"
+          accessibilityLabel="Clear search"
+          hitSlop={8}
+        >
+          <Ionicons name="close-circle" size={18} color={COLORS.textMuted} />
+        </MotionPressable>
+      )}
+      <View style={styles.eventHistorySortControl}>
+        <MotionPressable
+          style={({ pressed }) => [styles.eventHistorySortButton, pressed && styles.eventHistorySortPressed]}
+          onPress={() => setOpen((current) => !current)}
+          accessibilityRole="button"
+          accessibilityLabel={`Sort events by ${labels[value]}`}
+          accessibilityState={{ expanded: open }}
+        >
+          <Ionicons name="swap-vertical" size={19} color={COLORS.primaryLight} />
+        </MotionPressable>
+        {open && (
+          <View style={styles.eventHistorySortMenu}>
+            {(['latest', 'oldest', 'name'] as const).map((option) => (
+              <MotionPressable
+                key={option}
+                style={({ pressed }) => [
+                  styles.eventHistorySortOption,
+                  value === option && styles.eventHistorySortOptionSelected,
+                  pressed && styles.eventHistorySortPressed,
+                ]}
+                onPress={() => {
+                  onChange(option);
+                  setOpen(false);
+                }}
+                accessibilityRole="button"
+                accessibilityState={{ selected: value === option }}
+              >
+                <Text style={[
+                  styles.eventHistorySortOptionText,
+                  value === option && styles.eventHistorySortOptionTextSelected,
+                ]}>
+                  {labels[option]}
+                </Text>
+                {value === option && <Ionicons name="checkmark" size={15} color={COLORS.primary} />}
+              </MotionPressable>
+            ))}
+          </View>
+        )}
+      </View>
+    </View>
+  );
+}
+
 function AttendanceHistoryCard({ record, onViewDetails }: { record: AttendanceRecord; onViewDetails: () => void }) {
   const [descriptionWidth, setDescriptionWidth] = useState(0);
   const [descriptionHasMore, setDescriptionHasMore] = useState(false);
@@ -547,6 +740,15 @@ function AttendanceHistoryCard({ record, onViewDetails }: { record: AttendanceRe
               <Text style={styles.historyDetailLabel}>Event date</Text>
             </View>
             <Text style={styles.historyDetailValue}>{formatDate(record.eventStartTime)}</Text>
+          </View>
+        ) : null}
+        {record.lateTime ? (
+          <View style={styles.historyDetailRow}>
+            <View style={styles.historyDetailLabelWithIcon}>
+              <Ionicons name="time-outline" size={14} color={COLORS.textMuted} />
+              <Text style={styles.historyDetailLabel}>Late after</Text>
+            </View>
+            <Text style={styles.historyDetailValue}>{formatDate(record.lateTime)}</Text>
           </View>
         ) : null}
         <View style={styles.historyDetailRow}>
@@ -605,16 +807,25 @@ function AttendanceHistoryCard({ record, onViewDetails }: { record: AttendanceRe
   );
 }
 
-function StudentAttendanceOverview({ stats }: { stats: ReturnType<typeof calculateStudentAttendanceStats> }) {
+function StudentAttendanceOverview({
+  stats,
+  selectedFilter,
+  onMetricPress,
+}: {
+  stats: ReturnType<typeof calculateStudentAttendanceStats>;
+  selectedFilter: HistoryStatusFilter;
+  onMetricPress: (filter: HistoryStatusFilter) => void;
+}) {
+  const [insightsExpanded, setInsightsExpanded] = useState(attendanceInsightsExpanded);
   const metrics = [
-    { label: 'Total eligible events', value: stats.eligibleEvents, icon: 'calendar-outline' as const, color: COLORS.primary },
-    { label: 'Present', value: stats.present, icon: 'checkmark-circle-outline' as const, color: COLORS.success },
-    { label: 'Absent', value: stats.absent, icon: 'close-circle-outline' as const, color: COLORS.danger },
-    { label: 'Late', value: stats.late, icon: 'time-outline' as const, color: COLORS.warning },
+    { label: 'Total eligible events', value: stats.eligibleEvents, color: COLORS.primaryLight, filter: 'all' as const },
+    { label: 'Present', value: stats.present, color: COLORS.success, filter: 'present' as const },
+    { label: 'Absent', value: stats.absent, color: COLORS.danger, filter: 'absent' as const },
+    { label: 'Late', value: stats.late, color: COLORS.warning, filter: 'late' as const },
   ];
   const monthInsight = stats.currentMonthRate === null
     ? 'No finalized attendance outcomes recorded this month.'
-    : `This month: ${stats.currentMonthAttended} of ${stats.currentMonthEligible} eligible events attended (${stats.currentMonthRate}%).`;
+    : `${stats.currentMonthAttended} of ${stats.currentMonthEligible} eligible events attended (${stats.currentMonthRate}%).`;
   const streakInsight = stats.currentStreak > 0
     ? `${stats.currentStreak} consecutive ${stats.currentStreakType === 'attended' ? 'attended' : 'absent'} event${stats.currentStreak === 1 ? '' : 's'}`
     : stats.totalEvents === 0
@@ -624,30 +835,34 @@ function StudentAttendanceOverview({ stats }: { stats: ReturnType<typeof calcula
   return (
     <View style={styles.historyOverview}>
       <View style={styles.historyMetricGrid}>
-        {metrics.map(({ label, value, icon, color }) => (
-          <View key={label} style={styles.historyMetricCard}>
-            <View style={[styles.historyMetricIcon, { backgroundColor: `${color}18` }]}>
-              <Ionicons name={icon} size={17} color={color} />
-            </View>
-            <Text style={styles.historyMetricValue}>{value}</Text>
+        {metrics.map(({ label, value, color, filter }) => (
+          <MotionPressable
+            key={label}
+            style={({ pressed }) => [
+              styles.historyMetricCard,
+              selectedFilter === filter && styles.historyMetricCardSelected,
+              pressed && styles.historyMetricCardPressed,
+            ]}
+            onPress={() => onMetricPress(filter)}
+            accessibilityRole="button"
+            accessibilityLabel={`${label}: ${value}. Show ${filter === 'all' ? 'all' : filter} attendance records`}
+            accessibilityState={{ selected: selectedFilter === filter }}
+          >
+            <Text style={[styles.historyMetricValue, { color }]} numberOfLines={1} adjustsFontSizeToFit>{value}</Text>
             <Text style={styles.historyMetricLabel}>{label}</Text>
-          </View>
+          </MotionPressable>
         ))}
       </View>
 
       <View style={styles.historyRateHeader}>
-        <View>
-          <Text style={styles.historySectionLabel}>Attendance rate</Text>
-          <Text style={styles.historyRateValue}>{stats.attendanceRate === null ? '—' : `${stats.attendanceRate}%`}</Text>
-        </View>
-        <View style={styles.historyRateMeta}>
-          <Text style={styles.historyRateMetaText}>
-            {stats.attendanceRate === null
-              ? 'No finalized eligible events yet'
-              : `You attended ${stats.attended} out of ${stats.eligibleEvents} eligible events.`}
-          </Text>
-        </View>
+        <Text style={styles.historySectionLabel}>Attendance rate</Text>
+        <Text style={styles.historyRateValue}>{stats.attendanceRate === null ? '—' : `${stats.attendanceRate}%`}</Text>
       </View>
+      <Text style={styles.historyRateMetaText}>
+        {stats.attendanceRate === null
+          ? 'No finalized eligible events yet'
+          : `You attended ${stats.attended} out of ${stats.eligibleEvents} eligible events.`}
+      </Text>
       <View
         style={styles.historyRateTrack}
         accessibilityRole="progressbar"
@@ -662,18 +877,66 @@ function StudentAttendanceOverview({ stats }: { stats: ReturnType<typeof calcula
         Recorded present and late check-ins update immediately. Absences count only after finalization; excused outcomes are excluded from the rate.
       </Text>
 
-      <View style={styles.historyInsight}>
-        <View style={styles.historyInsightTextWrap}>
-          <View style={styles.historyInsightTitleRow}>
-            <Ionicons name="analytics-outline" size={19} color={COLORS.primary} />
-            <Text style={styles.historyInsightTitle}>Attendance Insights</Text>
+      <MotionPressable
+        style={({ pressed }) => [styles.historyInsight, pressed && styles.historyInsightPressed]}
+        onPress={() => setInsightsExpanded((expanded) => {
+          const nextExpanded = !expanded;
+          attendanceInsightsExpanded = nextExpanded;
+          return nextExpanded;
+        })}
+        accessibilityRole="button"
+        accessibilityLabel="Attendance insights"
+        accessibilityHint={insightsExpanded ? 'Collapse monthly attendance and streak details' : 'Expand monthly attendance and streak details'}
+        accessibilityState={{ expanded: insightsExpanded }}
+      >
+        <View style={styles.historyInsightHeader}>
+          <View style={styles.historyInsightIcon}>
+            <ChartNoAxesCombined size={19} color={COLORS.primaryLight} strokeWidth={2} />
           </View>
-          <Text style={styles.historyInsightText}>{monthInsight}</Text>
-          <Text style={styles.historyInsightText}>{streakInsight}</Text>
+          <View style={styles.historyInsightHeading}>
+            <Text style={styles.historyInsightTitle}>Attendance Insights</Text>
+            <Text style={styles.historyInsightSubtitle}>Monthly progress and current streak</Text>
+          </View>
+          <View style={styles.historyInsightToggle}>
+            {insightsExpanded
+              ? <ChevronUp size={17} color={COLORS.textSecondary} strokeWidth={2} />
+              : <ChevronDown size={17} color={COLORS.textSecondary} strokeWidth={2} />}
+          </View>
         </View>
-      </View>
+        {insightsExpanded && (
+          <View style={styles.historyInsightDetails}>
+            <View style={styles.historyInsightDetailRow}>
+              <View style={[styles.historyInsightDetailIcon, styles.historyInsightMonthIcon]}>
+                <CalendarDays size={16} color={COLORS.primaryLight} strokeWidth={2} />
+              </View>
+              <View style={styles.historyInsightDetailCopy}>
+                <Text style={styles.historyInsightDetailLabel}>This month</Text>
+                <Text style={styles.historyInsightText}>{monthInsight}</Text>
+              </View>
+            </View>
+            <View style={styles.historyInsightDetailRow}>
+              <View style={[
+                styles.historyInsightDetailIcon,
+                streakInsightIsAbsent(stats) ? styles.historyInsightAbsentIcon : styles.historyInsightStreakIcon,
+              ]}>
+                {streakInsightIsAbsent(stats)
+                  ? <CircleX size={16} color={COLORS.danger} strokeWidth={2} />
+                  : <Flame size={16} color={COLORS.warning} strokeWidth={2} />}
+              </View>
+              <View style={styles.historyInsightDetailCopy}>
+                <Text style={styles.historyInsightDetailLabel}>Current streak</Text>
+                <Text style={styles.historyInsightText}>{streakInsight}</Text>
+              </View>
+            </View>
+          </View>
+        )}
+      </MotionPressable>
     </View>
   );
+}
+
+function streakInsightIsAbsent(stats: ReturnType<typeof calculateStudentAttendanceStats>) {
+  return stats.currentStreak > 0 && stats.currentStreakType === 'absent';
 }
 
 function StudentAttendanceDetailsModal({
@@ -717,6 +980,7 @@ function StudentAttendanceDetailsModal({
                   icon={record.attendanceFinalized ? 'checkmark-circle-outline' : 'time-outline'}
                 />
                 {record.eventStartTime ? <HistoryDetail label="Event date and time" value={formatDate(record.eventStartTime)} icon="calendar-outline" /> : null}
+                {record.lateTime ? <HistoryDetail label="Late after" value={formatDate(record.lateTime)} icon="time-outline" /> : null}
                 <HistoryDetail
                   label={record.status === 'absent' ? 'Attendance recorded' : 'Checked in'}
                   value={formatDate(record.recordedAt ?? record.scannedAt)}
@@ -993,7 +1257,20 @@ const styles = StyleSheet.create({
     marginTop: 4,
     lineHeight: 19,
   },
-  adminHeader: { marginBottom: 20 },
+  adminHeader: { marginBottom: 12 },
+  eventHistorySearchBox: { minHeight: 52, flexDirection: 'row', alignItems: 'center', marginBottom: 14, paddingLeft: 15, paddingRight: 10, borderWidth: 1, borderColor: COLORS.border, borderRadius: 10, backgroundColor: COLORS.card, zIndex: 2 },
+  eventHistorySearchOpen: { zIndex: 10, elevation: 10 },
+  eventHistorySearchIcon: { marginRight: 12 },
+  eventHistorySearchInput: { flex: 1, minWidth: 0, color: COLORS.textPrimary, paddingVertical: 12, fontSize: 14, fontFamily: FONTS.regular },
+  eventHistorySearchClear: { width: 38, height: 42, alignItems: 'center', justifyContent: 'center', marginLeft: 8 },
+  eventHistorySortControl: { position: 'relative', flexShrink: 0, marginLeft: 12, paddingLeft: 12, borderLeftWidth: 1, borderLeftColor: COLORS.border, zIndex: 3 },
+  eventHistorySortButton: { width: 42, height: 42, alignItems: 'center', justifyContent: 'center', borderRadius: 8 },
+  eventHistorySortPressed: { opacity: 0.78, backgroundColor: COLORS.surfaceRaised },
+  eventHistorySortMenu: { position: 'absolute', top: 45, right: -5, width: 148, padding: 4, borderWidth: 1, borderColor: COLORS.border, borderRadius: 10, backgroundColor: COLORS.card, zIndex: 5, elevation: 5 },
+  eventHistorySortOption: { minHeight: 38, flexDirection: 'row', alignItems: 'center', justifyContent: 'space-between', paddingHorizontal: 9, borderRadius: 6 },
+  eventHistorySortOptionSelected: { backgroundColor: `${COLORS.primary}18` },
+  eventHistorySortOptionText: { color: COLORS.textSecondary, fontSize: 12, fontFamily: FONTS.medium },
+  eventHistorySortOptionTextSelected: { color: COLORS.primary, fontFamily: FONTS.semiBold },
   adminEyebrow: { color: COLORS.primary, fontSize: 10, fontWeight: '800', fontFamily: FONTS.extraBold, letterSpacing: 1.1, marginBottom: 4 },
   adminTitle: { color: COLORS.textPrimary, fontSize: 22, fontWeight: '800', fontFamily: FONTS.extraBold, letterSpacing: -0.4 },
   adminList: { paddingBottom: 28 },
@@ -1003,6 +1280,7 @@ const styles = StyleSheet.create({
   adminEventInfo: { flex: 1, minWidth: 0 },
   adminEventTitle: { color: COLORS.textPrimary, fontSize: 15, fontWeight: '700', fontFamily: FONTS.bold, letterSpacing: -0.15 },
   adminEventCode: { color: COLORS.textSecondary, fontSize: 12, fontFamily: FONTS.regular, marginTop: 4 },
+  adminEventCreator: { color: COLORS.textMuted, fontSize: 11, lineHeight: 15, fontFamily: FONTS.regular, marginTop: 3 },
   adminCardFooter: { borderTopWidth: 1, borderTopColor: COLORS.border, marginTop: 11, paddingTop: 10 },
   adminAttendanceMetrics: { minWidth: 0, gap: 8 },
   adminMetricOverview: { flexDirection: 'row', alignItems: 'center', justifyContent: 'space-between', gap: 8 },
@@ -1053,25 +1331,143 @@ const styles = StyleSheet.create({
   historyRetryText: { color: COLORS.textOnPrimary, fontSize: 14, fontFamily: FONTS.semiBold },
   historyList: { paddingBottom: 28, flexGrow: 1 },
   historyCount: { color: COLORS.textMuted, fontSize: 11, fontWeight: '600', fontFamily: FONTS.semiBold, marginBottom: 9 },
-  historyOverview: { backgroundColor: COLORS.card, borderColor: COLORS.border, borderWidth: 1, borderRadius: 16, padding: 15, marginBottom: 16 },
-  historyMetricGrid: { flexDirection: 'row', flexWrap: 'wrap', justifyContent: 'space-between', gap: 8, marginBottom: 15 },
-  historyMetricCard: { width: '48%', minHeight: 82, justifyContent: 'center', backgroundColor: COLORS.card, borderWidth: 1, borderColor: COLORS.border, borderRadius: 12, paddingHorizontal: 11, paddingVertical: 9 },
-  historyMetricIcon: { width: 28, height: 28, alignItems: 'center', justifyContent: 'center', borderRadius: 9 },
-  historyMetricValue: { color: COLORS.textPrimary, fontSize: 19, lineHeight: 23, fontWeight: '800', fontFamily: FONTS.extraBold, marginTop: 4 },
-  historyMetricLabel: { color: COLORS.textSecondary, fontSize: 10, lineHeight: 14, fontFamily: FONTS.medium, marginTop: 1 },
+  historyOverview: { backgroundColor: COLORS.surface, borderColor: COLORS.border, borderWidth: 1, borderRadius: 16, padding: 13, marginBottom: 16 },
+  historyMetricGrid: { flexDirection: 'row', flexWrap: 'wrap', justifyContent: 'space-between', rowGap: 8, marginBottom: 13 },
+  historyMetricCard: {
+    width: '48.5%',
+    minHeight: 76,
+    alignItems: 'center',
+    justifyContent: 'center',
+    backgroundColor: COLORS.surfaceRaised,
+    borderWidth: 1,
+    borderColor: COLORS.border,
+    borderRadius: 12,
+    paddingHorizontal: 9,
+    paddingVertical: 6,
+  },
+  historyMetricCardSelected: {
+    backgroundColor: `${COLORS.primary}20`,
+    borderColor: COLORS.primary,
+  },
+  historyMetricCardPressed: {
+    backgroundColor: COLORS.surface,
+    borderColor: COLORS.primaryLight,
+    opacity: 0.9,
+  },
+  historyMetricValue: {
+    fontSize: 26,
+    lineHeight: 30,
+    fontWeight: '800',
+    fontFamily: FONTS.extraBold,
+    textAlign: 'center',
+    minWidth: 0,
+    marginBottom: 1,
+  },
+  historyMetricLabel: {
+    color: COLORS.textSecondary,
+    fontSize: 11,
+    lineHeight: 14,
+    fontFamily: FONTS.semiBold,
+    textAlign: 'center',
+    minHeight: 14,
+    width: '100%',
+  },
   historyRateHeader: { flexDirection: 'row', alignItems: 'center', justifyContent: 'space-between', gap: 10 },
-  historySectionLabel: { color: COLORS.textPrimary, fontSize: 13, fontWeight: '700', fontFamily: FONTS.bold },
-  historyRateValue: { color: COLORS.textPrimary, fontSize: 28, lineHeight: 34, fontWeight: '800', fontFamily: FONTS.extraBold, marginTop: 3 },
-  historyRateMeta: { flexDirection: 'row', alignItems: 'center', gap: 5, flexShrink: 1, justifyContent: 'flex-end' },
-  historyRateMetaText: { color: COLORS.textSecondary, fontSize: 11, lineHeight: 15, fontFamily: FONTS.medium, textAlign: 'right', flexShrink: 1 },
-  historyRateTrack: { height: 8, borderRadius: 99, overflow: 'hidden', backgroundColor: COLORS.surface, marginTop: 11 },
-  historyRateProgress: { height: '100%', borderRadius: 99, backgroundColor: COLORS.primary },
-  historyRateNote: { color: COLORS.textMuted, fontSize: 10, lineHeight: 15, fontFamily: FONTS.regular, marginTop: 8 },
-  historyInsight: { flexDirection: 'row', alignItems: 'flex-start', gap: 8, backgroundColor: `${COLORS.primary}12`, borderRadius: 11, padding: 10, marginTop: 13 },
-  historyInsightTextWrap: { flex: 1, gap: 4 },
-  historyInsightTitleRow: { flexDirection: 'row', alignItems: 'center', gap: 6 },
-  historyInsightTitle: { color: COLORS.textPrimary, fontSize: 12, fontWeight: '700', fontFamily: FONTS.bold, marginBottom: 1 },
-  historyInsightText: { color: COLORS.textSecondary, fontSize: 11, lineHeight: 16, fontFamily: FONTS.regular },
+  historySectionLabel: { color: COLORS.textPrimary, fontSize: 14, fontWeight: '700', fontFamily: FONTS.bold },
+  historyRateValue: { color: COLORS.textPrimary, fontSize: 30, lineHeight: 36, fontWeight: '800', fontFamily: FONTS.extraBold },
+  historyRateMetaText: { color: COLORS.textSecondary, fontSize: 12, lineHeight: 17, fontFamily: FONTS.medium, marginTop: 2 },
+  historyRateTrack: { height: 10, borderRadius: 99, overflow: 'hidden', backgroundColor: COLORS.surfaceRaised, marginTop: 12 },
+  historyRateProgress: { height: '100%', borderRadius: 99, backgroundColor: COLORS.primaryLight },
+  historyRateNote: { color: COLORS.textMuted, fontSize: 11, lineHeight: 16, fontFamily: FONTS.regular, marginTop: 9 },
+  historyInsight: {
+    marginTop: 14,
+    padding: 12,
+    borderRadius: 14,
+    borderWidth: 1,
+    borderColor: COLORS.border,
+    backgroundColor: COLORS.card,
+  },
+  historyInsightPressed: {
+    backgroundColor: COLORS.card,
+    borderColor: COLORS.primary,
+  },
+  historyInsightHeader: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    gap: 10,
+    minHeight: 42,
+  },
+  historyInsightIcon: {
+    width: 36,
+    height: 36,
+    flexShrink: 0,
+    alignItems: 'center',
+    justifyContent: 'center',
+    borderRadius: 11,
+    backgroundColor: COLORS.card,
+    borderWidth: 1,
+    borderColor: COLORS.border,
+  },
+  historyInsightHeading: { flex: 1, minWidth: 0, gap: 2 },
+  historyInsightTitle: {
+    color: COLORS.textPrimary,
+    fontSize: 14,
+    fontWeight: '700',
+    fontFamily: FONTS.bold,
+  },
+  historyInsightSubtitle: {
+    color: COLORS.textMuted,
+    fontSize: 11,
+    lineHeight: 15,
+    fontFamily: FONTS.regular,
+  },
+  historyInsightToggle: {
+    width: 34,
+    height: 34,
+    flexShrink: 0,
+    alignItems: 'center',
+    justifyContent: 'center',
+    borderRadius: 10,
+    backgroundColor: COLORS.surfaceRaised,
+    borderWidth: 1,
+    borderColor: COLORS.border,
+  },
+  historyInsightDetails: { gap: 8, marginTop: 10 },
+  historyInsightDetailRow: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    gap: 10,
+    padding: 10,
+    borderRadius: 11,
+    borderWidth: 1,
+    borderColor: COLORS.border,
+    backgroundColor: COLORS.card,
+    minHeight: 64,
+  },
+  historyInsightDetailIcon: {
+    width: 30,
+    height: 30,
+    flexShrink: 0,
+    alignItems: 'center',
+    justifyContent: 'center',
+    borderRadius: 9,
+  },
+  historyInsightMonthIcon: { backgroundColor: `${COLORS.primary}18` },
+  historyInsightStreakIcon: { backgroundColor: `${COLORS.warning}18` },
+  historyInsightAbsentIcon: { backgroundColor: `${COLORS.danger}18` },
+  historyInsightDetailCopy: { flex: 1, minWidth: 0, gap: 2 },
+  historyInsightDetailLabel: {
+    color: COLORS.textPrimary,
+    fontSize: 12,
+    fontFamily: FONTS.semiBold,
+  },
+  historyInsightText: {
+    color: COLORS.textSecondary,
+    fontSize: 12,
+    lineHeight: 17,
+    fontFamily: FONTS.regular,
+    flexShrink: 1,
+  },
   historySearchBox: { minHeight: 46, flexDirection: 'row', alignItems: 'center', gap: 9, backgroundColor: COLORS.card, borderColor: COLORS.border, borderWidth: 1, borderRadius: 12, paddingHorizontal: 12, marginBottom: 10 },
   historySearchInput: { flex: 1, minWidth: 0, height: 44, color: COLORS.textPrimary, fontSize: 13, fontFamily: FONTS.regular, paddingVertical: 0 },
   historyFilters: { gap: 7, paddingBottom: 10 },

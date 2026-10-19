@@ -1,7 +1,7 @@
 import { useCallback, useEffect, useRef, useState } from 'react';
 import { router, useFocusEffect } from 'expo-router';
 import DateTimePicker, { type DateTimePickerEvent } from '@react-native-community/datetimepicker';
-import { ActivityIndicator, Alert, Platform, ScrollView, StyleSheet, Text, TextInput, View } from 'react-native';
+import { ActivityIndicator, Alert, Animated, Platform, ScrollView, StyleSheet, Text, TextInput, View } from 'react-native';
 import MotionPressable from '@/components/MotionPressable';
 import { useReducedMotion } from '@/hooks/useReducedMotion';
 import { animateLayoutChange } from '@/lib/motion';
@@ -16,9 +16,11 @@ import StatusBadge from '@/components/StatusBadge';
 
 import { COLORS } from '@/constants/colors';
 import { FONTS } from '@/constants/fonts';
+import { MOTION } from '@/constants/motion';
 import { useAuth } from '@/lib/auth';
+import { subscribeToSupabaseDataChanges } from '@/lib/supabaseRealtime';
 import { approveTeacher, deleteAdminUser, deactivateAdminUser, getAdminDashboardData, reactivateAdminUser, updateAdminUser, type AdminDashboardData } from '@/lib/admin';
-import { getProfile } from '@/lib/profiles';
+import { getProfileWithError } from '@/lib/profiles';
 import { archiveEvent, createEvent, deleteEvent, setEventStatus, type CloudEvent } from '@/lib/events';
 import { assignStudent, formatCourseLabel, type EventAudienceScope } from '@/lib/academic';
 
@@ -46,6 +48,38 @@ const DEFAULT_ADMIN_DROPDOWN_STATE: Record<AdminDropdownKey, boolean> = {
 
 function getAdminSectionStorageKey(userId: string) {
   return `admin-dashboard-sections-${userId}`;
+}
+
+function getEventCreatorLabel(users: AdminDashboardData['users'], createdBy: string | null) {
+  const creator = createdBy ? users.find((item) => item.id === createdBy) : undefined;
+  return creator?.full_name || creator?.email || 'Unknown user';
+}
+
+function formatAdminTime(value: Date) {
+  return value.toLocaleTimeString('en-US', { hour: 'numeric', minute: '2-digit' });
+}
+
+function parseAdminTime(value: string) {
+  const match = value.trim().match(/^(\d{1,2})(?::(\d{2}))?\s*(AM|PM)?$/i);
+  if (!match) return null;
+
+  const hours = Number(match[1]);
+  const minutes = match[2] === undefined ? null : Number(match[2]);
+  if ((minutes !== null && minutes > 59) || (match[3] ? hours < 1 || hours > 12 : hours > 23)) return null;
+
+  return {
+    hours: match[3]
+      ? (hours % 12) + (match[3].toUpperCase() === 'PM' ? 12 : 0)
+      : hours,
+    minutes,
+  };
+}
+
+function applyAdminTime(value: Date, time: ReturnType<typeof parseAdminTime>) {
+  if (!time) return value;
+  const next = new Date(value);
+  next.setHours(time.hours, time.minutes ?? value.getMinutes(), 0, 0);
+  return next;
 }
 
 async function getAdminDropdownState(userId: string) {
@@ -100,7 +134,9 @@ export default function AdminScreen() {
   const [adminDropdownsOpen, setAdminDropdownsOpen] = useState<Record<AdminDropdownKey, boolean>>(DEFAULT_ADMIN_DROPDOWN_STATE);
   const [sectionsLoadedForUserId, setSectionsLoadedForUserId] = useState<string | null>(null);
   const [authorized, setAuthorized] = useState<boolean | null>(null);
+  const [dashboardLoading, setDashboardLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
+  const [dashboardRetry, setDashboardRetry] = useState(0);
   const [statusLoading, setStatusLoading] = useState<string | null>(null);
   const [message, setMessage] = useState<string | null>(null);
   const [userSearch, setUserSearch] = useState('');
@@ -119,7 +155,6 @@ export default function AdminScreen() {
   const [newEventEnd, setNewEventEnd] = useState(() => new Date(Date.now() + 60 * 60 * 1000));
   const [newEventLateAfter, setNewEventLateAfter] = useState(() => new Date(Date.now() + 15 * 60 * 1000));
   const [newEventPicker, setNewEventPicker] = useState<'start' | 'end' | 'late' | null>(null);
-  const [newEventPickerPart, setNewEventPickerPart] = useState<'date' | 'time'>('date');
   const [qrEventId, setQrEventId] = useState<string | null>(null);
   const [newEventAudienceMode, setNewEventAudienceMode] = useState<'all' | 'groups'>('all');
   const [newEventAudience, setNewEventAudience] = useState<EventAudienceScope>({ courseIds: [], yearLevelIds: [], sectionIds: [] });
@@ -171,40 +206,63 @@ export default function AdminScreen() {
 
   useFocusEffect(useCallback(() => {
     let cancelled = false;
+    let refreshTimer: ReturnType<typeof setTimeout> | undefined;
 
     async function loadDashboard() {
+      setDashboardLoading(true);
       if (!user) {
         setAuthorized(false);
+        setDashboardLoading(false);
         return;
       }
 
-      setError(null);
-      const profile = await getProfile(user.id, session?.access_token);
-      if (cancelled) return;
+      let profileVerified = false;
+      try {
+        setError(null);
+        const { profile, error: profileError } = await getProfileWithError(user.id, session?.access_token);
+        if (cancelled) return;
+        if (profileError) throw new Error(`Unable to verify administrator access: ${profileError}`);
 
-      if (profile?.role !== 'admin' || profile.is_active === false) {
-        setAuthorized(false);
+        if (profile?.role !== 'admin' || profile.is_active === false) {
+          setAuthorized(false);
+          setDashboard(null);
+          return;
+        }
+
+        profileVerified = true;
+        setAuthorized(true);
+        const result = await getAdminDashboardData(session);
+        if (cancelled) return;
+
+        if (result.error) {
+          setError(result.error);
+          setMessage(`Dashboard refresh failed: ${result.error}`);
+          return;
+        }
+        if (!result.data) throw new Error('The administrator dashboard returned no data.');
+        setDashboard(result.data);
+      } catch (error) {
+        if (cancelled) return;
+        console.error('Unable to load administrator dashboard.', error);
+        setAuthorized(profileVerified);
         setDashboard(null);
-        return;
+        setError(error instanceof Error ? error.message : 'Unable to load administrator data. Please try again.');
+      } finally {
+        if (!cancelled) setDashboardLoading(false);
       }
-
-      setAuthorized(true);
-      const result = await getAdminDashboardData();
-      if (cancelled) return;
-
-      if (result.error) {
-        setError(result.error);
-        setMessage(`Dashboard refresh failed: ${result.error}`);
-        return;
-      }
-      setDashboard(result.data);
     }
 
     void loadDashboard();
+    const unsubscribe = subscribeToSupabaseDataChanges(() => {
+      if (refreshTimer) clearTimeout(refreshTimer);
+      refreshTimer = setTimeout(() => { void loadDashboard(); }, 200);
+    });
     return () => {
       cancelled = true;
+      if (refreshTimer) clearTimeout(refreshTimer);
+      unsubscribe();
     };
-  }, [session?.access_token, user]));
+  }, [dashboardRetry, session, user]));
 
   const changeStatus = async (event: AdminDashboardData['events'][number]) => {
     const nextStatus = event.status === 'open' ? 'closed' : 'open';
@@ -260,7 +318,7 @@ export default function AdminScreen() {
     }
 
     setEditingAcademicUserId(null);
-    const refreshed = await getAdminDashboardData();
+    const refreshed = await getAdminDashboardData(session);
     setAdminActionLoading(null);
     if (refreshed.error || !refreshed.data) {
       setMessage(`Academic group updated, but the dashboard could not refresh: ${refreshed.error ?? 'Please reload.'}`);
@@ -287,7 +345,7 @@ export default function AdminScreen() {
     confirmAdminAction('Approve teacher account?', `${item.email} will receive teacher event-management access.`, 'Approve teacher', () => {
       void (async () => {
         setAdminActionLoading(item.id);
-        const result = await approveTeacher(item.id);
+        const result = await approveTeacher(item.id, session);
         setAdminActionLoading(null);
         if (result.error) { setMessage(result.error); return; }
         setDashboard((current) => current ? {
@@ -295,6 +353,7 @@ export default function AdminScreen() {
           users: current.users.map((user) => user.id === item.id ? {
             ...user,
             role: 'teacher',
+            teacher_requested_at: null,
             academic_level_id: null,
             course_id: null,
             year_level_id: null,
@@ -338,7 +397,7 @@ export default function AdminScreen() {
         void (async () => {
             setAdminActionLoading(item.id);
             setMessage(null);
-            const result = await deleteAdminUser(item.id);
+            const result = await deleteAdminUser(item.id, session);
             setAdminActionLoading(null);
             if (result.error) {
               setMessage(result.error);
@@ -350,7 +409,7 @@ export default function AdminScreen() {
               users: current.users.filter((user) => user.id !== item.id),
             } : current);
             setEditingAcademicUserId(null);
-            const refreshed = await getAdminDashboardData();
+            const refreshed = await getAdminDashboardData(session);
             if (refreshed.data) {
               setDashboard(refreshed.data);
               setMessage('User and related records permanently deleted.');
@@ -383,7 +442,7 @@ export default function AdminScreen() {
       () => {
         void (async () => {
           setAdminActionLoading(event.id);
-          const result = await deleteEvent(event.id);
+          const result = await deleteEvent(event.id, session);
           setAdminActionLoading(null);
           if (result.error) { setMessage(result.error); return; }
           setDashboard((current) => current ? {
@@ -413,7 +472,7 @@ export default function AdminScreen() {
       venue: newEventVenue,
       description: newEventDescription,
       audience: newEventAudienceMode === 'groups' ? newEventAudience : undefined,
-    });
+    }, session);
     setAdminActionLoading(null);
     if (result.error) { setMessage(result.error); return; }
     if (!result.data) {
@@ -425,7 +484,7 @@ export default function AdminScreen() {
     setNewEventStart(new Date()); setNewEventEnd(new Date(Date.now() + 60 * 60 * 1000)); setNewEventLateAfter(new Date(Date.now() + 15 * 60 * 1000)); setNewEventPicker(null);
     setNewEventAudienceMode('all'); setNewEventAudience({ courseIds: [], yearLevelIds: [], sectionIds: [] });
     setCreatedAdminEvent(createdEvent);
-    const refreshed = await getAdminDashboardData();
+    const refreshed = await getAdminDashboardData(session);
     if (refreshed.error || !refreshed.data) {
       setDashboard((current) => current ? {
         ...current,
@@ -452,7 +511,11 @@ export default function AdminScreen() {
   }
 
   if (!dashboard) {
-    return <State text={error ?? 'Unable to load administrator data.'} />;
+    if (dashboardLoading) return <State text="Loading administrator dashboard..." loading />;
+    return <State
+      text={error ?? 'Unable to load administrator data.'}
+      onRetry={error ? () => setDashboardRetry((attempt) => attempt + 1) : undefined}
+    />;
   }
 
   return (
@@ -504,41 +567,28 @@ export default function AdminScreen() {
         <TextInput style={styles.input} value={newEventTitle} onChangeText={setNewEventTitle} placeholder="Event title" placeholderTextColor={COLORS.textSecondary} />
         <TextInput style={styles.input} value={newEventCode} onChangeText={setNewEventCode} autoCapitalize="characters" placeholder="Event code" placeholderTextColor={COLORS.textSecondary} />
         <Text style={styles.fieldLabel}>Starts</Text>
-        <AdminDateField value={newEventStart} onDatePress={() => { setNewEventPickerPart('date'); setNewEventPicker('start'); }} onTimePress={() => { setNewEventPickerPart('time'); setNewEventPicker('start'); }} />
+        <AdminDateField value={newEventStart} onDatePress={() => setNewEventPicker('start')} onTimeChange={(time) => setNewEventStart((current) => applyAdminTime(current, time))} />
         <Text style={styles.fieldLabel}>Ends</Text>
-        <AdminDateField value={newEventEnd} onDatePress={() => { setNewEventPickerPart('date'); setNewEventPicker('end'); }} onTimePress={() => { setNewEventPickerPart('time'); setNewEventPicker('end'); }} />
+        <AdminDateField value={newEventEnd} onDatePress={() => setNewEventPicker('end')} onTimeChange={(time) => setNewEventEnd((current) => applyAdminTime(current, time))} />
         <Text style={styles.fieldLabel}>Late after</Text>
-        <AdminDateField value={newEventLateAfter} onDatePress={() => { setNewEventPickerPart('date'); setNewEventPicker('late'); }} onTimePress={() => { setNewEventPickerPart('time'); setNewEventPicker('late'); }} />
+        <AdminDateField value={newEventLateAfter} onDatePress={() => setNewEventPicker('late')} onTimeChange={(time) => setNewEventLateAfter((current) => applyAdminTime(current, time))} />
         {newEventPicker && <DateTimePicker
-          key={`${newEventPicker}-${newEventPickerPart}`}
+          key={newEventPicker}
           value={newEventPicker === 'start' ? newEventStart : newEventPicker === 'end' ? newEventEnd : newEventLateAfter}
-          mode={newEventPickerPart}
+          mode="date"
           display={Platform.OS === 'android' ? 'default' : 'spinner'}
           onChange={(pickerEvent: DateTimePickerEvent, selected?: Date) => {
             if (pickerEvent.type === 'dismissed' || !selected || !newEventPicker) {
               setNewEventPicker(null);
-              setNewEventPickerPart('date');
               return;
             }
             const current = newEventPicker === 'start' ? newEventStart : newEventPicker === 'end' ? newEventEnd : newEventLateAfter;
             const next = new Date(current);
-            if (newEventPickerPart === 'date') {
-              next.setFullYear(selected.getFullYear(), selected.getMonth(), selected.getDate());
-              if (newEventPicker === 'start') setNewEventStart(next);
-              else if (newEventPicker === 'end') setNewEventEnd(next);
-              else setNewEventLateAfter(next);
-              if (Platform.OS === 'android') {
-                setNewEventPickerPart('time');
-                return;
-              }
-            } else {
-              next.setHours(selected.getHours(), selected.getMinutes(), 0, 0);
-            }
+            next.setFullYear(selected.getFullYear(), selected.getMonth(), selected.getDate());
             if (newEventPicker === 'start') setNewEventStart(next);
             else if (newEventPicker === 'end') setNewEventEnd(next);
             else setNewEventLateAfter(next);
             setNewEventPicker(null);
-            setNewEventPickerPart('date');
           }}
         />}
         <TextInput style={styles.input} value={newEventVenue} onChangeText={setNewEventVenue} placeholder="Venue (optional)" placeholderTextColor={COLORS.textSecondary} />
@@ -546,10 +596,10 @@ export default function AdminScreen() {
         <EventAudiencePicker mode={newEventAudienceMode} onModeChange={setNewEventAudienceMode} scope={newEventAudience} onScopeChange={setNewEventAudience} disabled={adminActionLoading === 'create'} />
         <MotionPressable style={styles.primaryButton} disabled={adminActionLoading === 'create'} onPress={createAdminEvent}><Text style={styles.primaryButtonText}>{adminActionLoading === 'create' ? 'Creating...' : 'Create Event'}</Text></MotionPressable>
         {createdAdminEvent && <View style={styles.createdEventPanel}>
-          <Text style={styles.createdEventTitle}>Event created successfully</Text>
-          <Text style={styles.meta}>{createdAdminEvent.event_code}</Text>
+          <Text style={styles.createdEventTitle}>Event created</Text>
+          <Text style={styles.createdEventCode}>Event code · {createdAdminEvent.event_code}</Text>
           <EventQRCode event={createdAdminEvent} />
-          <MotionPressable style={styles.smallButton} onPress={() => setCreatedAdminEvent(null)}><Text style={styles.statusButtonText}>Dismiss QR</Text></MotionPressable>
+          <MotionPressable style={styles.smallButton} onPress={() => setCreatedAdminEvent(null)}><Text style={styles.statusButtonText}>Close QR</Text></MotionPressable>
         </View>}
       </CollapsiblePanel>
 
@@ -562,14 +612,14 @@ export default function AdminScreen() {
 
       <CollapsibleSection
         title="Registered Users"
-        description="Search accounts, edit student groups, and manage user access."
+        description="Review teacher requests, search accounts, edit student groups, and manage user access."
         count={dashboard.users.length}
         open={adminDropdownsOpen['registered-users']}
         onToggle={() => setAdminDropdownsOpen((current) => ({ ...current, 'registered-users': !current['registered-users'] }))}
         onLayout={(position) => { dashboardSectionPositions.current['registered-users'] = position; }}
       >
         <TextInput style={styles.search} value={userSearch} onChangeText={setUserSearch} placeholder="Search ID, name, email, or role" placeholderTextColor={COLORS.textSecondary} />
-        {dashboard.users.filter((item) => `${item.display_id} ${item.full_name ?? ''} ${item.email} ${item.role} ${item.course_code ?? ''} ${item.course_name ?? ''} ${item.year_level_name ?? ''} ${item.section_name ?? ''} ${item.section_code ?? ''}`.toLowerCase().includes(userSearch.toLowerCase().trim())).map((item) => (
+        {dashboard.users.filter((item) => `${item.display_id} ${item.full_name ?? ''} ${item.email} ${item.role} ${item.teacher_requested_at ? 'teacher request pending' : ''} ${item.course_code ?? ''} ${item.course_name ?? ''} ${item.year_level_name ?? ''} ${item.section_name ?? ''} ${item.section_code ?? ''}`.toLowerCase().includes(userSearch.toLowerCase().trim())).map((item) => (
           <View style={styles.card} key={item.id}>
             <View style={styles.userIdentity}>
               {editingUserId === item.id ? <TextInput style={styles.input} value={editingName} onChangeText={setEditingName} placeholder="Full name" placeholderTextColor={COLORS.textSecondary} /> : <Text style={styles.cardTitle}>{item.full_name || 'Unnamed user'}</Text>}
@@ -624,6 +674,7 @@ export default function AdminScreen() {
             </>}
             <View style={styles.userStatusRow}>
               <Text style={styles.badge}>{item.role.toUpperCase()}</Text>
+              {item.teacher_requested_at && <StatusBadge status="pending" label="Teacher request" shape="subtle" />}
               <StatusBadge status={item.is_active ? 'active' : 'inactive'} label={item.is_active ? 'Active' : 'Deactivated'} shape="subtle" />
             </View>
             <View style={styles.userActions}>
@@ -632,7 +683,7 @@ export default function AdminScreen() {
                 {item.role === 'student' && editingAcademicUserId !== item.id && <MotionPressable style={({ pressed }) => [styles.userActionButton, pressed && styles.userActionPressed]} onPress={() => startEditingAcademicGroup(item)}><Text style={styles.statusButtonText}>Edit Course / Block</Text></MotionPressable>}
               </View>
               <View style={[styles.actionRow, styles.userActionRow]}>
-                {item.role === 'student' && item.is_active && item.id !== user?.id && <MotionPressable style={({ pressed }) => [styles.userActionButton, pressed && styles.userActionPressed, adminActionLoading === item.id && styles.userActionDisabled]} disabled={adminActionLoading === item.id} onPress={() => approveTeacherAccount(item)}><Text style={styles.statusButtonText}>{adminActionLoading === item.id ? 'Approving...' : 'Approve Teacher'}</Text></MotionPressable>}
+                {item.role === 'student' && item.teacher_requested_at && item.is_active && item.id !== user?.id && <MotionPressable style={({ pressed }) => [styles.userActionButton, pressed && styles.userActionPressed, adminActionLoading === item.id && styles.userActionDisabled]} disabled={adminActionLoading === item.id} onPress={() => approveTeacherAccount(item)}><Text style={styles.statusButtonText}>{adminActionLoading === item.id ? 'Approving...' : 'Approve Teacher Request'}</Text></MotionPressable>}
                 {item.is_active && item.id !== user?.id && <MotionPressable style={({ pressed }) => [styles.userActionButton, styles.smallDangerButton, pressed && styles.userActionPressed, adminActionLoading === item.id && styles.userActionDisabled]} disabled={adminActionLoading === item.id} onPress={() => deactivateUser(item)}><Text style={styles.dangerText}>Deactivate</Text></MotionPressable>}
                 {item.is_active && item.id === user?.id && <Text style={styles.protectedText}>Current account protected</Text>}
                 {!item.is_active && item.id !== user?.id && <MotionPressable style={({ pressed }) => [styles.userActionButton, pressed && styles.userActionPressed, adminActionLoading === item.id && styles.userActionDisabled]} disabled={adminActionLoading === item.id} onPress={() => reactivateUser(item)}><Text style={styles.statusButtonText}>{adminActionLoading === item.id ? 'Reactivating...' : 'Reactivate'}</Text></MotionPressable>}
@@ -652,18 +703,23 @@ export default function AdminScreen() {
         onLayout={(position) => { dashboardSectionPositions.current.events = position; }}
       >
         {dashboard.events.map((item) => (
-          <View style={styles.card} key={item.id}>
-            <Text style={styles.cardTitle}>{item.title}</Text>
-            <Text style={styles.meta}>{item.event_code}</Text>
+          <View style={styles.adminEventCard} key={item.id}>
+            <View style={styles.adminEventHeader}>
+              <View style={styles.adminEventInfo}>
+                <Text style={styles.cardTitle} numberOfLines={2}>{item.title}</Text>
+                <Text style={styles.meta}>{item.event_code}</Text>
+                <Text style={styles.adminEventCreator} numberOfLines={1}>
+                  Created by {getEventCreatorLabel(dashboard.users, item.created_by)}
+                </Text>
+              </View>
+              <StatusBadge status={item.archived_at ? 'archived' : item.status} />
+            </View>
             {item.audience_mode === 'legacy' && <Text style={styles.warning}>Participant eligibility needs repair before attendance management.</Text>}
             {qrEventId === item.id && item.status === 'open' && !item.archived_at && (
               <View style={styles.qrPanel}>
                 <EventQRCode event={item} compact />
               </View>
             )}
-            <View style={styles.eventStatusRow}>
-              <StatusBadge status={item.archived_at ? 'archived' : item.status} />
-            </View>
             <View style={styles.eventActions}>
               <View style={styles.eventActionRow}>
                 <MotionPressable
@@ -694,7 +750,7 @@ export default function AdminScreen() {
 
       <CollapsibleSection
         title="Attendance Summary"
-        description="See the total check-ins recorded for each event."
+        description="A quick view of attendance across your events."
         count={dashboard.attendance.length}
         open={adminDropdownsOpen['attendance-summary']}
         onToggle={() => setAdminDropdownsOpen((current) => ({ ...current, 'attendance-summary': !current['attendance-summary'] }))}
@@ -705,7 +761,11 @@ export default function AdminScreen() {
         ) : dashboard.attendance.map((item) => (
           <View style={styles.card} key={item.eventId}>
             <Text style={styles.cardTitle}>{item.eventTitle}</Text>
-            <Text style={styles.meta}>{item.attendeeCount} check-ins · {item.absentCount} absent</Text>
+            <Text style={styles.meta}>
+              {item.totalStudents} {item.totalStudents === 1 ? 'student' : 'students'}
+              {' · '}{item.attendeeCount} checked in
+              {' · '}{item.absentCount} absent
+            </Text>
           </View>
         ))}
       </CollapsibleSection>
@@ -713,11 +773,16 @@ export default function AdminScreen() {
   );
 }
 
-function State({ text, loading = false }: { text: string; loading?: boolean }) {
+function State({ text, loading = false, onRetry }: { text: string; loading?: boolean; onRetry?: () => void }) {
   return (
     <View style={styles.state}>
       {loading && <ActivityIndicator color={COLORS.primary} />}
       <Text style={styles.stateText}>{text}</Text>
+      {onRetry && (
+        <MotionPressable style={styles.stateRetryButton} onPress={onRetry} accessibilityRole="button">
+          <Text style={styles.stateRetryText}>Try again</Text>
+        </MotionPressable>
+      )}
     </View>
   );
 }
@@ -742,15 +807,39 @@ function Summary({ label, value, onPress }: { label: string; value: number; onPr
   );
 }
 
-function AdminDateField({ value, onDatePress, onTimePress }: { value: Date; onDatePress: () => void; onTimePress: () => void }) {
+function AdminDateField({ value, onDatePress, onTimeChange }: { value: Date; onDatePress: () => void; onTimeChange: (time: ReturnType<typeof parseAdminTime>) => void }) {
+  const [timeText, setTimeText] = useState(() => formatAdminTime(value));
+
+  useEffect(() => {
+    setTimeText(formatAdminTime(value));
+  }, [value]);
+
   return <View style={styles.dateField}>
     <MotionPressable style={({ pressed }) => [styles.datePart, pressed && styles.datePartPressed]} onPress={onDatePress} accessibilityRole="button" accessibilityLabel={`Change date, ${value.toLocaleDateString('en-PH', { dateStyle: 'medium' })}`}>
       <Text style={styles.dateText} numberOfLines={1}>{value.toLocaleDateString('en-PH', { month: 'short', day: 'numeric' })}</Text>
     </MotionPressable>
-    <MotionPressable style={({ pressed }) => [styles.timePart, pressed && styles.datePartPressed]} onPress={onTimePress} accessibilityRole="button" accessibilityLabel={`Change time, ${value.toLocaleTimeString('en-PH', { timeStyle: 'short' })}`}>
-      <Text style={styles.dateText} numberOfLines={1}>{value.toLocaleTimeString('en-PH', { hour: 'numeric', minute: '2-digit' })}</Text>
-    </MotionPressable>
-    <MotionPressable style={({ pressed }) => pressed && styles.datePartPressed} onPress={onDatePress} accessibilityRole="button" accessibilityLabel="Open date picker" hitSlop={6}>
+    <TextInput
+      style={styles.timeInput}
+      value={timeText}
+      onChangeText={setTimeText}
+      onEndEditing={() => {
+        const parsedTime = parseAdminTime(timeText);
+        if (!parsedTime) {
+          setTimeText(formatAdminTime(value));
+          return;
+        }
+        onTimeChange(parsedTime);
+      }}
+      placeholder="9:30 AM"
+      placeholderTextColor={COLORS.textSecondary}
+      keyboardType="default"
+      autoCapitalize="characters"
+      selectTextOnFocus
+      returnKeyType="done"
+      accessibilityLabel={`Event time, currently ${formatAdminTime(value)}`}
+      accessibilityHint="Enter an hour such as 12, or a full time such as 9:30 AM or 14:30."
+    />
+    <MotionPressable style={({ pressed }) => [styles.datePickerButton, pressed && styles.datePartPressed]} onPress={onDatePress} accessibilityRole="button" accessibilityLabel="Open date picker" hitSlop={6}>
       <Ionicons name="calendar-outline" size={17} color={COLORS.primary} />
     </MotionPressable>
   </View>;
@@ -788,7 +877,7 @@ function CollapsiblePanel({
           </View>
         </View>
         <View style={styles.chevronCircle}>
-          <Ionicons name={open ? 'chevron-up' : 'chevron-down'} size={16} color={COLORS.primaryLight} />
+          <ExpandableChevron open={open} />
         </View>
       </MotionPressable>
       {open && children}
@@ -833,11 +922,40 @@ function CollapsibleSection({
           </View>
         </View>
         <View style={styles.chevronCircle}>
-          <Ionicons name={open ? 'chevron-up' : 'chevron-down'} size={16} color={COLORS.primaryLight} />
+          <ExpandableChevron open={open} />
         </View>
       </MotionPressable>
       {open && children}
     </View>
+  );
+}
+
+function ExpandableChevron({ open }: { open: boolean }) {
+  const reduceMotion = useReducedMotion();
+  const rotation = useRef(new Animated.Value(open ? 1 : 0)).current;
+
+  useEffect(() => {
+    if (reduceMotion !== false) {
+      rotation.setValue(open ? 1 : 0);
+      return;
+    }
+    const animation = Animated.timing(rotation, {
+      toValue: open ? 1 : 0,
+      duration: MOTION.stateDuration,
+      useNativeDriver: Platform.OS !== 'web',
+    });
+    animation.start();
+    return () => animation.stop();
+  }, [open, reduceMotion, rotation]);
+
+  return (
+    <Animated.View style={{
+      transform: [{
+        rotate: rotation.interpolate({ inputRange: [0, 1], outputRange: ['0deg', '180deg'] }),
+      }],
+    }}>
+      <Ionicons name="chevron-down" size={16} color={COLORS.primaryLight} />
+    </Animated.View>
   );
 }
 
@@ -866,6 +984,10 @@ const styles = StyleSheet.create({
   sectionHeaderPressed: { opacity: 0.82 },
   chevronCircle: { width: 32, height: 32, borderRadius: 10, borderWidth: 1, borderColor: `${COLORS.primary}44`, backgroundColor: `${COLORS.primary}12`, alignItems: 'center', justifyContent: 'center' },
   card: { backgroundColor: COLORS.card, borderColor: `${COLORS.border}CC`, borderWidth: 1, borderRadius: 10, padding: 12, marginBottom: 8 },
+  adminEventCard: { backgroundColor: COLORS.card, borderColor: `${COLORS.border}CC`, borderWidth: 1, borderRadius: 12, padding: 14, marginBottom: 9 },
+  adminEventHeader: { flexDirection: 'row', alignItems: 'flex-start', gap: 10 },
+  adminEventInfo: { flex: 1, minWidth: 0, gap: 3 },
+  adminEventCreator: { color: COLORS.textMuted, fontSize: 11, lineHeight: 15, fontFamily: FONTS.regular, marginTop: 2 },
   userIdentity: { gap: 1 },
   cardTitle: { fontSize: 15, lineHeight: 20, fontWeight: '600', fontFamily: FONTS.semiBold, color: COLORS.textPrimary },
   userDetails: { marginTop: 7, gap: 2 },
@@ -875,8 +997,7 @@ const styles = StyleSheet.create({
   messageBox: { flexDirection: 'row', alignItems: 'center', gap: 7, backgroundColor: `${COLORS.primary}14`, borderColor: `${COLORS.primary}44`, borderWidth: 1, borderRadius: 10, paddingHorizontal: 11, paddingVertical: 9, marginBottom: 14 },
   message: { color: COLORS.primary, fontSize: 13, fontFamily: FONTS.medium, flex: 1 },
   warning: { color: COLORS.warning, fontSize: 12, fontFamily: FONTS.regular, lineHeight: 17, marginTop: 6 },
-  eventStatusRow: { flexDirection: 'row', alignItems: 'center', marginTop: 12, marginBottom: 8 },
-  eventActions: { width: '100%', gap: 8 },
+  eventActions: { width: '100%', gap: 7, marginTop: 13, paddingTop: 11, borderTopWidth: 1, borderTopColor: COLORS.border },
   eventActionRow: { width: '100%', flexDirection: 'row', alignItems: 'center', gap: 8 },
   eventActionButton: { flex: 1, minWidth: 0, minHeight: 40, alignItems: 'center', justifyContent: 'center' },
   status: { fontSize: 13, fontWeight: '700', fontFamily: FONTS.bold, color: COLORS.success },
@@ -893,9 +1014,10 @@ const styles = StyleSheet.create({
   academicEditPanel: { backgroundColor: COLORS.surfaceRaised, borderRadius: 8, borderWidth: 1, borderColor: COLORS.border, padding: 10, marginTop: 10 },
   academicEditTitle: { color: COLORS.textPrimary, fontSize: 13, fontWeight: '700', fontFamily: FONTS.bold, marginBottom: 4 },
   fieldLabel: { color: COLORS.textPrimary, fontSize: 12, fontWeight: '600', fontFamily: FONTS.semiBold, marginTop: 6, marginBottom: 3 },
-  dateField: { minHeight: 42, backgroundColor: COLORS.surfaceRaised, borderColor: COLORS.border, borderWidth: 1, borderRadius: 8, paddingHorizontal: 10, paddingVertical: 8, marginBottom: 6, flexDirection: 'row', alignItems: 'center', gap: 6 },
-  datePart: { flexShrink: 0 },
-  timePart: { flex: 1, minWidth: 0 },
+  dateField: { minHeight: 46, backgroundColor: COLORS.surfaceRaised, borderColor: COLORS.border, borderWidth: 1, borderRadius: 8, paddingHorizontal: 6, marginBottom: 6, flexDirection: 'row', alignItems: 'stretch', gap: 2 },
+  datePart: { minHeight: 44, flexShrink: 0, justifyContent: 'center', paddingHorizontal: 4 },
+  timeInput: { flex: 1, minWidth: 70, minHeight: 44, paddingHorizontal: 4, paddingVertical: 0, color: COLORS.textPrimary, fontSize: 13, fontFamily: FONTS.regular },
+  datePickerButton: { width: 32, minHeight: 44, alignItems: 'center', justifyContent: 'center' },
   datePartPressed: { opacity: 0.7 },
   dateText: { color: COLORS.textPrimary, fontSize: 13, fontFamily: FONTS.regular },
   dateChevron: { color: COLORS.primary, fontSize: 20 },
@@ -917,8 +1039,11 @@ const styles = StyleSheet.create({
   primaryButtonText: { color: COLORS.textOnPrimary, fontWeight: '600', fontFamily: FONTS.semiBold },
   qrPanel: { backgroundColor: '#FFFFFF', borderRadius: 12, padding: 14, alignItems: 'center', marginTop: 12 },
   qrHint: { color: '#334155', fontSize: 12, fontFamily: FONTS.regular, marginTop: 10, textAlign: 'center' },
-  createdEventPanel: { backgroundColor: COLORS.surface, borderColor: COLORS.border, borderWidth: 1, borderRadius: 10, padding: 12, marginTop: 12, alignItems: 'center' },
-  createdEventTitle: { color: COLORS.success, fontWeight: '700', fontFamily: FONTS.bold, fontSize: 14, marginTop: 4 },
+  createdEventPanel: { backgroundColor: COLORS.surface, borderColor: COLORS.border, borderWidth: 1, borderRadius: 12, padding: 16, marginTop: 14, alignItems: 'center', gap: 6 },
+  createdEventTitle: { color: COLORS.success, fontWeight: '700', fontFamily: FONTS.bold, fontSize: 16, marginTop: 2 },
+  createdEventCode: { color: COLORS.textSecondary, fontSize: 13, lineHeight: 18, fontFamily: FONTS.medium },
   state: { flex: 1, justifyContent: 'center', alignItems: 'center', backgroundColor: 'transparent', padding: 24 },
   stateText: { color: COLORS.textSecondary, textAlign: 'center', marginTop: 12 },
+  stateRetryButton: { minHeight: 42, justifyContent: 'center', marginTop: 12, paddingHorizontal: 16, borderWidth: 1, borderColor: COLORS.border, borderRadius: 10, backgroundColor: COLORS.surface },
+  stateRetryText: { color: COLORS.primaryLight, fontSize: 13, fontFamily: FONTS.semiBold },
 });

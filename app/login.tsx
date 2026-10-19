@@ -153,6 +153,14 @@ export default function LoginScreen() {
         setError(profileMessage);
         return;
       }
+      if (profile.role !== selectedRole) {
+        await clearLocalSession();
+        sessionNeedsCleanup = false;
+        const selectedRoleLabel = ROLE_OPTIONS.find((option) => option.role === selectedRole)?.label ?? selectedRole;
+        const accountRoleLabel = ROLE_OPTIONS.find((option) => option.role === profile.role)?.label ?? profile.role;
+        setError(`This account is registered as ${accountRoleLabel}, not ${selectedRoleLabel}. Select ${accountRoleLabel} to sign in.`);
+        return;
+      }
       setSelectedRole(profile.role);
       sessionNeedsCleanup = false;
       router.replace('/(tabs)');

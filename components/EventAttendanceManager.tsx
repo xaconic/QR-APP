@@ -5,6 +5,8 @@ import { ActivityIndicator, Platform, ScrollView, StyleSheet, Text, View } from 
 
 import MotionPressable from '@/components/MotionPressable';
 import { useReducedMotion } from '@/hooks/useReducedMotion';
+import { useAuth } from '@/lib/auth';
+import { subscribeToSupabaseDataChanges } from '@/lib/supabaseRealtime';
 import { animateLayoutChange } from '@/lib/motion';
 import Ionicons from '@expo/vector-icons/Ionicons';
 import * as FileSystem from 'expo-file-system/legacy';
@@ -40,6 +42,23 @@ import {
 } from '@/lib/academic';
 
 type EventChoice = { id: string; title: string; event_code?: string; start_time?: string | null; end_time?: string | null };
+const ATTENDANCE_SUMMARY_TIMEOUT_MS = 15000;
+
+function isSameAudienceConfig(left: EventAudienceConfig | null, right: EventAudienceConfig) {
+  return left?.mode === right.mode
+    && left.scope.courseIds.length === right.scope.courseIds.length
+    && left.scope.courseIds.every((id, index) => id === right.scope.courseIds[index])
+    && left.scope.yearLevelIds.length === right.scope.yearLevelIds.length
+    && left.scope.yearLevelIds.every((id, index) => id === right.scope.yearLevelIds[index])
+    && left.scope.sectionIds.length === right.scope.sectionIds.length
+    && left.scope.sectionIds.every((id, index) => id === right.scope.sectionIds[index])
+    && left.groups.length === right.groups.length
+    && left.groups.every((group, index) => (
+      group.courseId === right.groups[index]?.courseId
+      && group.yearLevelId === right.groups[index]?.yearLevelId
+      && group.sectionId === right.groups[index]?.sectionId
+    ));
+}
 
 export default function EventAttendanceManager({
   events,
@@ -52,6 +71,7 @@ export default function EventAttendanceManager({
   onExpandedChange?: (expanded: boolean) => void;
   description?: string;
 }) {
+  const { session } = useAuth();
   const reduceMotion = useReducedMotion();
   const [internalExpanded, setInternalExpanded] = useState(false);
   const isExpanded = expanded ?? internalExpanded;
@@ -61,6 +81,7 @@ export default function EventAttendanceManager({
   const [sections, setSections] = useState<AcademicSection[]>([]);
   const [audienceConfig, setAudienceConfig] = useState<EventAudienceConfig | null>(null);
   const [audienceLoaded, setAudienceLoaded] = useState(false);
+  const [audienceError, setAudienceError] = useState<string | null>(null);
   const [courseId, setCourseId] = useState('');
   const [yearLevelId, setYearLevelId] = useState('');
   const [sectionId, setSectionId] = useState('');
@@ -68,9 +89,9 @@ export default function EventAttendanceManager({
   const [search, setSearch] = useState('');
   const [summary, setSummary] = useState<EventAttendanceSummary | null>(null);
   const [loading, setLoading] = useState(false);
+  const [summaryError, setSummaryError] = useState<string | null>(null);
+  const [summaryRetry, setSummaryRetry] = useState(0);
   const [exporting, setExporting] = useState(false);
-  const [exportCount, setExportCount] = useState<number | null>(null);
-  const [exportCountLoading, setExportCountLoading] = useState(false);
   const [exportFeedback, setExportFeedback] = useState<{ message: string; error: boolean } | null>(null);
   const [message, setMessage] = useState<string | null>(null);
   const [corrections, setCorrections] = useState<AttendanceCorrection[] | null>(null);
@@ -84,64 +105,56 @@ export default function EventAttendanceManager({
   }, [events, selectedEventId]);
   useEffect(() => { Promise.all([getCourses(), getYearLevels()]).then(([c, y]) => { setCourses(c); setYearLevels(y); }); }, []);
   useEffect(() => {
-    let active = true;
     setCourseId('');
     setYearLevelId('');
     setSectionId('');
     setAudienceConfig(null);
     setAudienceLoaded(false);
-    if (!selectedEventId) return () => { active = false; };
-    getEventAudienceConfig(selectedEventId).then((config) => {
-      if (!active) return;
-      setAudienceConfig(config);
-      setAudienceLoaded(true);
-    });
-    return () => { active = false; };
+    setAudienceError(null);
   }, [selectedEventId]);
   useFocusEffect(useCallback(() => {
     let active = true;
+    let refreshTimer: ReturnType<typeof setTimeout> | undefined;
     if (!selectedEventId) return () => { active = false; };
-    getEventAudienceConfig(selectedEventId).then((config) => {
-      if (!active) return;
-      setAudienceConfig(config);
-      setAudienceLoaded(true);
+    const refreshAudience = () => {
+      getEventAudienceConfig(selectedEventId, session).then((config) => {
+        if (!active) return;
+        setAudienceConfig((current) => isSameAudienceConfig(current, config) ? current : config);
+        setAudienceLoaded(true);
+        setAudienceError(null);
+      }).catch((error: unknown) => {
+        if (!active) return;
+        console.error('Unable to refresh selected event eligibility settings.', error);
+        setAudienceError(error instanceof Error ? error.message : 'Event eligibility settings could not be loaded.');
+        setAudienceLoaded(true);
+      });
+    };
+    refreshAudience();
+    const unsubscribe = subscribeToSupabaseDataChanges(() => {
+      if (refreshTimer) clearTimeout(refreshTimer);
+      refreshTimer = setTimeout(refreshAudience, 200);
     });
-    return () => { active = false; };
-  }, [selectedEventId]));
+    return () => {
+      active = false;
+      if (refreshTimer) clearTimeout(refreshTimer);
+      unsubscribe();
+    };
+  }, [selectedEventId, session]));
   useEffect(() => {
     getAcademicSections().then(setSections);
     setSectionId('');
   }, []);
+  const exportCount = useMemo(() => {
+    if (!summary) return null;
+    const needle = search.trim().toLocaleLowerCase();
+    return summary.students.filter((student) => (
+      student.attendance_id !== null
+      && (!needle || `${student.full_name ?? ''} ${student.display_id ?? ''} ${student.email}`.toLocaleLowerCase().includes(needle))
+    )).length;
+  }, [search, summary]);
   useEffect(() => {
-    let active = true;
-    if (!selectedEventId || !audienceLoaded || !audienceConfig || audienceConfig.mode === 'legacy') {
-      setExportCount(null);
-      setExportCountLoading(false);
-      return () => { active = false; };
-    }
-    setExportCount(null);
-    setExportCountLoading(true);
     setExportFeedback(null);
-    const filters = {
-      courseId,
-      yearLevelId,
-      sectionId,
-      status,
-      search,
-    };
-    getEventAttendanceExportPage(selectedEventId, filters, 0, 1).then((result) => {
-      if (!active) return;
-      setExportCount(result.data?.totalCount ?? null);
-      setExportFeedback(result.error ? { message: result.error, error: true } : null);
-      setExportCountLoading(false);
-    }).catch((error: unknown) => {
-      if (!active) return;
-      setExportCount(null);
-      setExportFeedback({ message: errorMessage(error), error: true });
-      setExportCountLoading(false);
-    });
-    return () => { active = false; };
-  }, [selectedEventId, audienceLoaded, audienceConfig, courseId, yearLevelId, sectionId, status, search]);
+  }, [selectedEventId, courseId, yearLevelId, sectionId, status, search]);
   useEffect(() => {
     const requestId = ++correctionsRequestId.current;
     setCorrections(null);
@@ -158,7 +171,7 @@ export default function EventAttendanceManager({
     setCorrectionsLoading(true);
     setCorrectionsError(null);
     try {
-      const result = await getEventAttendanceCorrections(selectedEventId);
+      const result = await getEventAttendanceCorrections(selectedEventId, session);
       if (requestId !== correctionsRequestId.current) return;
       setCorrections(result.data);
       setCorrectionsError(result.error);
@@ -174,19 +187,45 @@ export default function EventAttendanceManager({
 
   useEffect(() => {
     let active = true;
+    let timedOut = false;
     if (!selectedEventId || !audienceLoaded || !audienceConfig || audienceConfig.mode === 'legacy') {
       setSummary(null);
+      setLoading(false);
+      setSummaryError(null);
       return () => { active = false; };
     }
     setLoading(true);
-    getEventAttendanceSummary(selectedEventId, { courseId, yearLevelId, sectionId, status: status || undefined }).then((result) => {
+    setSummary(null);
+    setSummaryError(null);
+    setMessage(null);
+    const timeout = setTimeout(() => {
+      timedOut = true;
       if (!active) return;
-      setSummary(result.data);
-      setMessage(result.error);
+      console.error('The selected event attendance summary did not finish before the request deadline.');
       setLoading(false);
-    });
-    return () => { active = false; };
-  }, [selectedEventId, audienceLoaded, audienceConfig, courseId, yearLevelId, sectionId, status]);
+      setSummaryError('Attendance data is taking too long to load. Check your connection and try again.');
+    }, ATTENDANCE_SUMMARY_TIMEOUT_MS);
+    getEventAttendanceSummary(selectedEventId, { courseId, yearLevelId, sectionId, status: status || undefined }, session)
+      .then((result) => {
+        if (!active || timedOut) return;
+        setSummary(result.data);
+        setSummaryError(result.error);
+      })
+      .catch((error: unknown) => {
+        if (!active || timedOut) return;
+        console.error('Unable to load the selected event attendance summary.', error);
+        setSummary(null);
+        setSummaryError(errorMessage(error));
+      })
+      .finally(() => {
+        clearTimeout(timeout);
+        if (active) setLoading(false);
+      });
+    return () => {
+      active = false;
+      clearTimeout(timeout);
+    };
+  }, [selectedEventId, audienceLoaded, audienceConfig, courseId, yearLevelId, sectionId, status, session, summaryRetry]);
 
   const visibleStudents = useMemo(() => {
     const needle = search.trim().toLowerCase();
@@ -233,7 +272,7 @@ export default function EventAttendanceManager({
 
   const refresh = async () => {
     if (!selectedEventId) return;
-    const result = await getEventAttendanceSummary(selectedEventId, { courseId, yearLevelId, sectionId, status: status || undefined });
+    const result = await getEventAttendanceSummary(selectedEventId, { courseId, yearLevelId, sectionId, status: status || undefined }, session);
     setSummary(result.data); setMessage(result.error);
   };
 
@@ -247,7 +286,7 @@ export default function EventAttendanceManager({
   };
 
   const exportReport = async () => {
-    if (!activeEvent || !selectedEventId || exporting) return;
+    if (!activeEvent || !selectedEventId || !summary || summaryError || exporting) return;
     setExporting(true);
     setExportFeedback(null);
     try {
@@ -258,7 +297,7 @@ export default function EventAttendanceManager({
       const pageSize = 500;
 
       do {
-        const result = await getEventAttendanceExportPage(selectedEventId, filters, offset, pageSize);
+        const result = await getEventAttendanceExportPage(selectedEventId, filters, offset, pageSize, session);
         if (result.error || !result.data) throw new Error(result.error ?? 'Could not load attendance records.');
         if (expectedCount !== null && result.data.totalCount !== expectedCount) {
           throw new Error('Attendance records changed during export. Please try again.');
@@ -279,12 +318,19 @@ export default function EventAttendanceManager({
         throw new Error('The attendance export contained duplicate or missing records. Please try again.');
       }
 
-      if (records.length === 0) {
+      const eligibleStudentIds = new Set(
+        summary.students
+          .filter((student) => student.attendance_id !== null)
+          .map((student) => student.id),
+      );
+      const eligibleRecords = records.filter((record) => eligibleStudentIds.has(record.student_id));
+
+      if (eligibleRecords.length === 0) {
         setExportFeedback({ message: 'No attendance records match the selected event and filters.', error: false });
         return;
       }
 
-      const csv = buildAttendanceCsv(records);
+      const csv = buildAttendanceCsv(eligibleRecords);
       const exportDate = formatCsvDatePH(new Date().toISOString());
       const filename = buildAttendanceFilename(activeEvent.title, exportDate);
       if (Platform.OS === 'web') {
@@ -302,7 +348,7 @@ export default function EventAttendanceManager({
         await FileSystem.writeAsStringAsync(uri, csv, { encoding: FileSystem.EncodingType.UTF8 });
         await Sharing.shareAsync(uri, { mimeType: 'text/csv', dialogTitle: 'Share attendance report' });
       }
-      setExportFeedback({ message: `Exported ${records.length} records to ${filename}.`, error: false });
+      setExportFeedback({ message: `Exported ${eligibleRecords.length} records to ${filename}.`, error: false });
     } catch (error: unknown) {
       setExportFeedback({ message: errorMessage(error), error: true });
     } finally {
@@ -340,6 +386,7 @@ export default function EventAttendanceManager({
         {events.map((event) => <MotionPressable key={event.id} style={[styles.chip, event.id === selectedEventId && styles.chipActive]} onPress={() => setSelectedEventId(event.id)}><Text style={[styles.chipText, event.id === selectedEventId && styles.chipTextActive]}>{event.title}</Text></MotionPressable>)}
       </ScrollView>
       {activeEvent?.event_code && <Text style={styles.eventMeta}>{activeEvent.event_code}</Text>}
+      {audienceLoaded && audienceError && <Text style={styles.error}>{audienceError}</Text>}
       {audienceLoaded && audienceConfig?.mode === 'legacy' && <Text style={styles.error}>No saved participant groups exist for this event. Configure its eligible groups in Edit Event before managing attendance.</Text>}
       <View style={styles.filters}>
         <Filter title="Course" label="All courses" value={courseId} options={visibleCourses.map((item) => ({ id: item.id, label: item.code }))} onChange={(value) => { setCourseId(value); setYearLevelId(''); setSectionId(''); }} />
@@ -348,7 +395,18 @@ export default function EventAttendanceManager({
         <Filter title="Attendance status" label="All statuses" value={status} options={[{ id: 'present', label: 'Present' }, { id: 'absent', label: 'Absent' }, { id: 'late', label: 'Late' }, { id: 'excused', label: 'Excused' }]} onChange={setStatus} />
       </View>
       <AppTextInput inputStyle={styles.search} value={search} onChangeText={setSearch} placeholder="Search name or student number" />
-      {loading ? <ActivityIndicator color={COLORS.primary} /> : summary && <>
+      {loading ? <ActivityIndicator color={COLORS.primary} /> : summaryError ? (
+        <View style={styles.summaryError}>
+          <Text style={styles.error}>{summaryError}</Text>
+          <MotionPressable
+            style={styles.summaryRetryButton}
+            onPress={() => setSummaryRetry((attempt) => attempt + 1)}
+            accessibilityRole="button"
+          >
+            <Text style={styles.summaryRetryText}>Retry attendance</Text>
+          </MotionPressable>
+        </View>
+      ) : summary && <>
         <View style={styles.summaryRow}>
           <Metric label="Eligible" value={summary.total} />
           <Metric label="Present" value={summary.present} />
@@ -359,25 +417,27 @@ export default function EventAttendanceManager({
         </View>
         <Text style={styles.completion}>{summary.total ? `${Math.round(((summary.total - summary.pending) / summary.total) * 100)}% complete` : '0% complete'}</Text>
         <Text style={styles.exportSummary} accessibilityLiveRegion="polite">
-          {activeEvent?.title ?? 'Selected event'} · {exportCountLoading ? 'Counting matching records…' : exportCount === null ? 'Matching record count unavailable' : `${exportCount} records match the selected filters`}
+          {activeEvent?.title ?? 'Selected event'} · {loading ? 'Loading matching records…' : exportCount === null ? 'Matching record count unavailable' : `${exportCount} records match the selected filters`}
         </Text>
-        <AppButton
-          title={exporting ? 'Preparing report...' : exportCount === 0 ? 'No records to export' : 'Export Attendance CSV'}
-          icon="download-outline"
-          onPress={exportReport}
-          disabled={exporting || exportCountLoading || exportCount === 0}
-          loading={exporting}
-          loadingTitle="Preparing report..."
-          compact
-        />
-        <AppButton
-          title={correctionsLoading ? 'Loading correction history...' : corrections === null ? 'View Correction History' : 'Refresh Correction History'}
-          icon="time-outline"
-          onPress={() => { void loadCorrections(); }}
-          disabled={correctionsLoading}
-          loading={correctionsLoading}
-          compact
-        />
+        <View style={styles.exportActions}>
+          <AppButton
+            title={exporting ? 'Preparing report...' : exportCount === 0 ? 'No records to export' : 'Export Attendance CSV'}
+            icon="download-outline"
+            onPress={exportReport}
+            disabled={exporting || loading || !summary || !!summaryError || exportCount === 0}
+            loading={exporting}
+            loadingTitle="Preparing report..."
+            compact
+          />
+          <AppButton
+            title={correctionsLoading ? 'Loading correction history...' : corrections === null ? 'View Correction History' : 'Refresh Correction History'}
+            icon="time-outline"
+            onPress={() => { void loadCorrections(); }}
+            disabled={correctionsLoading}
+            loading={correctionsLoading}
+            compact
+          />
+        </View>
         {correctionsError && <Text style={styles.error}>{correctionsError}</Text>}
         {corrections && (
           <View style={styles.correctionHistory}>
@@ -481,7 +541,8 @@ const styles = StyleSheet.create({
   filterText: { color: COLORS.textSecondary, fontSize: 11, fontFamily: FONTS.medium, lineHeight: 16 },
   filterTextActive: { color: COLORS.primary, fontFamily: FONTS.semiBold },
   search: { backgroundColor: COLORS.surfaceRaised, color: COLORS.textPrimary, borderWidth: 1, borderColor: COLORS.border, borderRadius: 8, minHeight: 44, paddingHorizontal: 12, paddingVertical: 8, marginVertical: 8, fontFamily: FONTS.regular },
-  exportSummary: { color: COLORS.textSecondary, fontSize: 12, fontFamily: FONTS.regular, marginTop: 12, marginBottom: 6 },
+  exportSummary: { color: COLORS.textSecondary, fontSize: 12, lineHeight: 18, fontFamily: FONTS.regular, marginTop: 12, marginBottom: 4 },
+  exportActions: { gap: 5 },
   correctionHistory: { marginTop: 12, padding: 10, borderWidth: 1, borderColor: COLORS.border, borderRadius: 8, backgroundColor: COLORS.surfaceRaised },
   correctionTitle: { color: COLORS.textPrimary, fontSize: 13, fontFamily: FONTS.semiBold, marginBottom: 6 },
   correctionRow: { paddingVertical: 7, borderTopWidth: 1, borderTopColor: COLORS.border },
@@ -505,5 +566,8 @@ const styles = StyleSheet.create({
   statusButtonText: { color: COLORS.textSecondary, fontSize: 11, fontWeight: '600', fontFamily: FONTS.semiBold, textTransform: 'capitalize' },
   statusButtonTextActive: { color: COLORS.primary },
   error: { color: COLORS.danger, fontSize: 12, fontFamily: FONTS.medium, marginTop: 6 },
+  summaryError: { alignItems: 'center', marginTop: 12 },
+  summaryRetryButton: { minHeight: 40, justifyContent: 'center', marginTop: 6, paddingHorizontal: 12, borderWidth: 1, borderColor: COLORS.border, borderRadius: 8, backgroundColor: COLORS.surface },
+  summaryRetryText: { color: COLORS.primaryLight, fontSize: 12, fontFamily: FONTS.semiBold },
   empty: { color: COLORS.textSecondary, textAlign: 'center', fontFamily: FONTS.regular, marginVertical: 16 },
 });

@@ -22,6 +22,7 @@ import { FONTS } from '@/constants/fonts';
 import { useAuth, signOut } from '@/lib/auth';
 import { getProfileWithError, updateProfile, type Profile } from '@/lib/profiles';
 import { formatCourseLabel, getAcademicGroupNames } from '@/lib/academic';
+import { subscribeToSupabaseDataChanges } from '@/lib/supabaseRealtime';
 
 export default function ProfileScreen() {
   const { user, session } = useAuth();
@@ -33,6 +34,8 @@ export default function ProfileScreen() {
   const [draftName, setDraftName] = useState('');
   const [editing, setEditing] = useState(false);
   const [saving, setSaving] = useState(false);
+  const [signOutHovered, setSignOutHovered] = useState(false);
+  const [signOutFocused, setSignOutFocused] = useState(false);
   const savingRef = useRef(false);
   const [academic, setAcademic] = useState<{ academicLevel: { code: string; name: string } | null; course: { code: string; name: string } | null; yearLevel: { name: string } | null; section: { section_code: string; section_name: string; academic_year: string } | null }>({ academicLevel: null, course: null, yearLevel: null, section: null });
   const router = useRouter();
@@ -47,6 +50,7 @@ export default function ProfileScreen() {
   useFocusEffect(
     useCallback(() => {
       let active = true;
+      let refreshTimer: ReturnType<typeof setTimeout> | undefined;
 
       if (!user) {
         setProfile(null);
@@ -58,25 +62,35 @@ export default function ProfileScreen() {
 
       setProfileLoading(true);
       setProfileError(null);
-      getProfileWithError(user.id, session?.access_token)
-        .then(({ profile: p, error }) => {
-          if (!active || !mountedRef.current) return;
-          setProfile(p);
-          setProfileError(error ?? (!p ? 'No Acadence profile was found for this account.' : null));
-          setDraftName(p?.full_name ?? '');
-          if (p) getAcademicGroupNames(p).then(setAcademic);
-        })
-        .catch((error: unknown) => {
-          if (!active || !mountedRef.current) return;
-          console.error('Unable to load the account profile.', error);
-          setProfileError(error instanceof Error ? error.message : 'Unable to load the account profile.');
-        })
-        .finally(() => {
-          if (active && mountedRef.current) setProfileLoading(false);
-        });
 
+      const loadProfile = () => {
+        getProfileWithError(user.id, session?.access_token)
+          .then(({ profile: p, error }) => {
+            if (!active || !mountedRef.current) return;
+            setProfile(p);
+            setProfileError(error ?? (!p ? 'No Acadence profile was found for this account.' : null));
+            setDraftName(p?.full_name ?? '');
+            if (p) getAcademicGroupNames(p).then(setAcademic);
+          })
+          .catch((error: unknown) => {
+            if (!active || !mountedRef.current) return;
+            console.error('Unable to load the account profile.', error);
+            setProfileError(error instanceof Error ? error.message : 'Unable to load the account profile.');
+          })
+          .finally(() => {
+            if (active && mountedRef.current) setProfileLoading(false);
+          });
+      };
+
+      loadProfile();
+      const unsubscribe = subscribeToSupabaseDataChanges(() => {
+        if (refreshTimer) clearTimeout(refreshTimer);
+        refreshTimer = setTimeout(loadProfile, 200);
+      });
       return () => {
         active = false;
+        if (refreshTimer) clearTimeout(refreshTimer);
+        unsubscribe();
       };
     }, [session?.access_token, user])
   );
@@ -97,7 +111,7 @@ export default function ProfileScreen() {
     try {
       const { error } = await updateProfile(user.id, {
         full_name: draftName.trim(),
-      });
+      }, session);
       if (!mountedRef.current) return;
 
       if (error) {
@@ -146,6 +160,7 @@ export default function ProfileScreen() {
       <View style={styles.header}>
         <View>
           <Text style={styles.title}>My Profile</Text>
+          <Text style={styles.subtitle}>Your account and academic details</Text>
         </View>
       </View>
 
@@ -160,7 +175,7 @@ export default function ProfileScreen() {
         <SurfaceCard style={styles.infoCard}>
           <View style={styles.profileCardHeader}>
             <View style={styles.avatar}>
-              <Ionicons name="person-outline" size={25} color={COLORS.primary} />
+              <Ionicons name="person-outline" size={25} color={COLORS.primaryLight} />
             </View>
             <View style={styles.profileIdentity}>
               <Text style={styles.identityName} numberOfLines={2}>
@@ -170,7 +185,7 @@ export default function ProfileScreen() {
             </View>
             {profile && !editing && <MotionPressable
               onPress={() => setEditing(true)}
-              style={styles.editButton}
+              style={({ pressed }) => [styles.editButton, pressed && styles.editButtonPressed]}
               accessibilityRole="button"
               accessibilityLabel="Edit profile name"
             >
@@ -236,21 +251,34 @@ export default function ProfileScreen() {
         </>
       ) : null}
 
-      <SurfaceCard style={styles.signOutCard}>
+      <MotionPressable
+        onPress={handleSignOut}
+        onHoverIn={() => setSignOutHovered(true)}
+        onHoverOut={() => setSignOutHovered(false)}
+        onFocus={() => setSignOutFocused(true)}
+        onBlur={() => setSignOutFocused(false)}
+        disabled={loading}
+        style={({ pressed }) => [
+          styles.signOutCard,
+          (signOutHovered || signOutFocused) && styles.signOutHighlighted,
+          pressed && styles.signOutPressed,
+          loading && styles.signOutDisabled,
+        ]}
+        accessibilityRole="button"
+        accessibilityLabel="Sign out"
+        accessibilityHint="Signs you out of your account"
+        accessibilityState={{ disabled: loading, busy: loading }}
+      >
         <View style={styles.signOutCopy}>
           <Text style={styles.signOutTitle}>Sign out</Text>
           <Text style={styles.signOutHint}>You can sign back in anytime.</Text>
         </View>
-        <MotionPressable
-          onPress={handleSignOut}
-          disabled={loading}
-          style={({ pressed }) => [styles.signOutButton, pressed && styles.signOutPressed, loading && styles.signOutDisabled]}
-          accessibilityRole="button"
-          accessibilityLabel="Sign out"
-        >
-          {loading ? <ActivityIndicator color={COLORS.danger} size="small" /> : <Ionicons name="log-out-outline" size={19} color={COLORS.danger} />}
-        </MotionPressable>
-      </SurfaceCard>
+        <View style={styles.signOutIcon}>
+          {loading
+            ? <ActivityIndicator color={COLORS.primaryLight} size="small" />
+            : <Ionicons name="log-out-outline" size={19} color={COLORS.primaryLight} />}
+        </View>
+      </MotionPressable>
     </ScrollView>
   );
 }
@@ -275,22 +303,25 @@ const styles = StyleSheet.create({
   container: {
     paddingHorizontal: 20,
   },
-  header: { flexDirection: 'row', alignItems: 'center', marginBottom: 20 },
+  header: { flexDirection: 'row', alignItems: 'center', marginBottom: 18 },
   eyebrow: { color: COLORS.primary, fontSize: 10, fontWeight: '800', letterSpacing: 1.1, marginBottom: 5 },
   title: {
-    fontSize: 26,
+    fontSize: 28,
+    lineHeight: 34,
     fontWeight: '800',
     fontFamily: FONTS.extraBold,
     color: COLORS.textPrimary,
-    letterSpacing: -0.4,
+    letterSpacing: -0.6,
   },
-  infoCard: { padding: 16, marginBottom: 14 },
-  profileCardHeader: { flexDirection: 'row', alignItems: 'center', gap: 12, marginBottom: 18 },
-  avatar: { width: 50, height: 50, borderRadius: 17, backgroundColor: `${COLORS.primary}1C`, borderWidth: 1, borderColor: `${COLORS.primary}33`, alignItems: 'center', justifyContent: 'center' },
-  profileIdentity: { flex: 1 },
-  identityName: { color: COLORS.textPrimary, fontSize: 17, fontWeight: '700', fontFamily: FONTS.bold, letterSpacing: -0.2 },
-  identityEmail: { color: COLORS.textSecondary, fontSize: 12, fontFamily: FONTS.regular, marginTop: 4 },
-  editButton: { minHeight: 40, flexDirection: 'row', alignItems: 'center', gap: 5, borderWidth: 1, borderColor: `${COLORS.primary}55`, backgroundColor: `${COLORS.primary}12`, paddingHorizontal: 10, paddingVertical: 7, borderRadius: 8 },
+  subtitle: { color: COLORS.textSecondary, fontSize: 13, lineHeight: 18, fontFamily: FONTS.regular, marginTop: 3 },
+  infoCard: { backgroundColor: COLORS.card, borderRadius: 18, padding: 16, marginBottom: 14 },
+  profileCardHeader: { flexDirection: 'row', alignItems: 'center', gap: 12, marginBottom: 16 },
+  avatar: { width: 52, height: 52, borderRadius: 17, backgroundColor: `${COLORS.primary}22`, borderWidth: 1, borderColor: `${COLORS.primary}55`, alignItems: 'center', justifyContent: 'center' },
+  profileIdentity: { flex: 1, minWidth: 0 },
+  identityName: { color: COLORS.textPrimary, fontSize: 17, lineHeight: 22, fontWeight: '700', fontFamily: FONTS.bold, letterSpacing: -0.2 },
+  identityEmail: { color: COLORS.textSecondary, fontSize: 12, lineHeight: 17, fontFamily: FONTS.regular, marginTop: 3 },
+  editButton: { minHeight: 40, flexDirection: 'row', alignItems: 'center', justifyContent: 'center', gap: 5, borderWidth: 1, borderColor: `${COLORS.primary}55`, backgroundColor: `${COLORS.primary}14`, paddingHorizontal: 11, borderRadius: 10 },
+  editButtonPressed: { backgroundColor: `${COLORS.primary}28`, borderColor: COLORS.primary },
   loadingCard: {
     backgroundColor: COLORS.card,
     borderColor: COLORS.border,
@@ -316,16 +347,16 @@ const styles = StyleSheet.create({
     fontSize: 10,
     fontWeight: '700',
     fontFamily: FONTS.bold,
-    color: COLORS.textSecondary,
+    color: COLORS.textMuted,
     letterSpacing: 0.7,
-    marginBottom: 4,
+    marginBottom: 5,
   },
   value: {
     fontSize: 14,
     color: COLORS.textPrimary,
     fontWeight: '600',
     fontFamily: FONTS.semiBold,
-    lineHeight: 20,
+    lineHeight: 21,
   },
   editHint: {
     fontSize: 12,
@@ -371,18 +402,56 @@ const styles = StyleSheet.create({
   cancelButton: { width: 44, height: 44, alignItems: 'center', justifyContent: 'center', borderWidth: 1, borderColor: COLORS.border, backgroundColor: COLORS.background, borderRadius: 8 },
   cancelButtonPressed: { backgroundColor: COLORS.surface, borderColor: COLORS.primary },
   nameActionDisabled: { opacity: 0.55 },
-  roleRow: { flexDirection: 'row', alignItems: 'center', gap: 11 },
-  detailRow: { flexDirection: 'row', alignItems: 'center', gap: 11, marginVertical: 10 },
-  detailIcon: { width: 34, height: 34, borderRadius: 8, backgroundColor: `${COLORS.primary}16`, alignItems: 'center', justifyContent: 'center' },
+  roleRow: { flexDirection: 'row', alignItems: 'center', gap: 12, paddingVertical: 10 },
+  detailRow: { flexDirection: 'row', alignItems: 'center', gap: 12, paddingVertical: 10 },
+  detailIcon: { width: 38, height: 38, borderRadius: 12, backgroundColor: `${COLORS.primary}18`, borderWidth: 1, borderColor: `${COLORS.primary}22`, alignItems: 'center', justifyContent: 'center' },
   detailContent: { flex: 1 },
-  profileDivider: { height: 1, backgroundColor: COLORS.border, marginVertical: 6 },
-  signOutCard: { flexDirection: 'row', alignItems: 'center', justifyContent: 'space-between', padding: 12, marginTop: 2 },
-  signOutCopy: { flex: 1 },
-  signOutTitle: { color: COLORS.textPrimary, fontSize: 14, fontWeight: '700', fontFamily: FONTS.bold },
-  signOutHint: { color: COLORS.textSecondary, fontSize: 12, fontFamily: FONTS.regular, marginTop: 4 },
-  signOutButton: { width: 44, height: 44, borderRadius: 10, backgroundColor: `${COLORS.danger}14`, borderWidth: 1, borderColor: `${COLORS.danger}44`, alignItems: 'center', justifyContent: 'center', marginLeft: 12 },
-  signOutPressed: { opacity: 0.7, transform: [{ scale: 0.96 }] },
-  signOutDisabled: { opacity: 0.55 },
+  profileDivider: { height: 1, backgroundColor: `${COLORS.border}CC`, marginVertical: 4 },
+  signOutCard: {
+    minHeight: 76,
+    flexDirection: 'row',
+    alignItems: 'center',
+    justifyContent: 'space-between',
+    paddingHorizontal: 16,
+    paddingVertical: 12,
+    marginTop: 2,
+    marginBottom: 4,
+    borderRadius: 16,
+    borderWidth: 1,
+    borderColor: COLORS.border,
+    backgroundColor: COLORS.card,
+  },
+  signOutHighlighted: {
+    borderColor: `${COLORS.primary}88`,
+    backgroundColor: COLORS.surface,
+  },
+  signOutCopy: { flex: 1, justifyContent: 'center', paddingRight: 12 },
+  signOutTitle: {
+    color: COLORS.textPrimary,
+    fontSize: 14,
+    fontWeight: '700',
+    fontFamily: FONTS.bold,
+    letterSpacing: 0.1,
+  },
+  signOutHint: {
+    color: COLORS.textSecondary,
+    fontSize: 12,
+    fontFamily: FONTS.regular,
+    lineHeight: 17,
+    marginTop: 3,
+  },
+  signOutIcon: {
+    width: 46,
+    height: 46,
+    alignItems: 'center',
+    justifyContent: 'center',
+  },
+  signOutPressed: {
+    borderColor: `${COLORS.primary}AA`,
+    backgroundColor: COLORS.surfaceRaised,
+    transform: [{ scale: 0.99 }],
+  },
+  signOutDisabled: { opacity: 0.6 },
   roleBadgeText: {
     color: COLORS.primary,
     fontSize: 12,
