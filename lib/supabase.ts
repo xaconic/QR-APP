@@ -1,6 +1,7 @@
 import { Platform } from 'react-native';
 import { createClient, type Session } from '@supabase/supabase-js';
 import * as SecureStore from 'expo-secure-store';
+import { retryTransientNetworkRequest, shouldRetryRequest } from './networkRetry';
 
 const REQUEST_TIMEOUT_MS = 15000;
 const WEB_SESSION_PERSISTENCE_KEY = 'acadence.remember-session';
@@ -130,30 +131,38 @@ export async function setSessionPersistence(remember: boolean) {
 }
 
 const fetchWithTimeout: typeof fetch = async (input, init) => {
-  const controller = new AbortController();
-  const requestSignal = init?.signal;
-  let timedOut = false;
-  const abortRequest = () => controller.abort();
+  const inputMethod = typeof input === 'string' || input instanceof URL ? 'GET' : input.method;
+  const method = (init?.method ?? inputMethod).toUpperCase();
+  const canRetry = shouldRetryRequest(method);
 
-  if (requestSignal?.aborted) abortRequest();
-  else requestSignal?.addEventListener('abort', abortRequest, { once: true });
+  const sendRequest = async () => {
+    const controller = new AbortController();
+    const requestSignal = init?.signal;
+    let timedOut = false;
+    const abortRequest = () => controller.abort();
 
-  const timeout = setTimeout(() => {
-    timedOut = true;
-    controller.abort();
-  }, REQUEST_TIMEOUT_MS);
+    if (requestSignal?.aborted) abortRequest();
+    else requestSignal?.addEventListener('abort', abortRequest, { once: true });
 
-  try {
-    return await fetch(input, { ...init, signal: controller.signal });
-  } catch (error) {
-    if (timedOut) {
-      throw new Error('The request timed out. Check your connection and try again.', { cause: error });
+    const timeout = setTimeout(() => {
+      timedOut = true;
+      controller.abort();
+    }, REQUEST_TIMEOUT_MS);
+
+    try {
+      return await fetch(input, { ...init, signal: controller.signal });
+    } catch (error) {
+      if (timedOut) {
+        throw new Error('The request timed out. Check your connection and try again.', { cause: error });
+      }
+      throw error;
+    } finally {
+      clearTimeout(timeout);
+      requestSignal?.removeEventListener('abort', abortRequest);
     }
-    throw error;
-  } finally {
-    clearTimeout(timeout);
-    requestSignal?.removeEventListener('abort', abortRequest);
-  }
+  };
+
+  return canRetry ? retryTransientNetworkRequest(sendRequest) : sendRequest();
 };
 
 const supabaseUrl = process.env.EXPO_PUBLIC_SUPABASE_URL || 'https://placeholder.supabase.co';

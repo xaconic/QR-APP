@@ -23,6 +23,7 @@ import Header from '@/components/Header';
 import { COLORS, FONT_SIZES, RADII, SPACING } from '@/constants/colors';
 import { FONTS } from '@/constants/fonts';
 import { clearLocalSession, signIn, useAuth } from '@/lib/auth';
+import { isTransientNetworkError } from '@/lib/networkRetry';
 import { getProfileWithError, type Role } from '@/lib/profiles';
 
 const ROLE_OPTIONS: Array<{ role: Role; label: string }> = [
@@ -66,7 +67,7 @@ export default function LoginScreen() {
   const [rememberMe, setRememberMe] = useState(false);
   const [keyboardVisible, setKeyboardVisible] = useState(false);
   const compact = keyboardVisible || height - insets.top - insets.bottom < 700 || width < 360;
-  const canSubmit = !!email.trim() && !!password && !loading && !sessionLoading && !session;
+  const canSubmit = !loading;
 
   useEffect(() => {
     if (!sessionLoading && !loading && allowSessionRedirect && session) router.replace('/(tabs)');
@@ -94,8 +95,17 @@ export default function LoginScreen() {
   }, [error]);
 
   const handleLogin = async () => {
-    if (sessionLoading || session || isSubmitting.current) return;
+    if (loading || isSubmitting.current) return;
     setError(null);
+    if (sessionLoading) {
+      setError('Your saved session is still being checked. Please wait a moment and try again.');
+      return;
+    }
+    if (session) {
+      router.replace('/(tabs)');
+      return;
+    }
+
     const normalizedEmail = email.trim();
     if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(normalizedEmail)) {
       setError('Enter a valid email address.');
@@ -115,11 +125,6 @@ export default function LoginScreen() {
     try {
       const { data, error: authError } = await signIn(normalizedEmail, password, rememberMe);
       if (authError) {
-        console.error('Supabase sign-in failed.', {
-          message: authError.message,
-          status: authError.status,
-          code: authError.code,
-        });
         setAllowSessionRedirect(true);
         setError(getSignInErrorMessage(authError.message));
         return;
@@ -141,7 +146,9 @@ export default function LoginScreen() {
           : !profile
           ? 'We could not find your Acadence profile. Please contact your administrator.'
           : 'This account is inactive. Please contact your administrator.';
-        if (profileError) console.error('Unable to load the signed-in account profile.', profileError);
+        if (profileError && !isTransientNetworkError(profileError)) {
+          console.error('Unable to load the signed-in account profile.', profileError);
+        }
         try {
           await clearLocalSession();
           sessionNeedsCleanup = false;
@@ -175,7 +182,7 @@ export default function LoginScreen() {
         }
       }
       setAllowSessionRedirect(true);
-      console.error('Sign-in could not be completed.', err);
+      if (!isTransientNetworkError(err)) console.error('Sign-in could not be completed.', err);
       setError(err instanceof Error
         ? getSignInErrorMessage(err.message)
         : 'Unable to verify your account right now. Please check your connection and try again.');

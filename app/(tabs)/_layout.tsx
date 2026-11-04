@@ -7,8 +7,11 @@ import MotionPressable from '@/components/MotionPressable';
 import { useAuth } from '@/lib/auth';
 import { subscribeToSupabaseRealtime } from '@/lib/supabaseRealtime';
 import { getProfileWithError, type Role } from '@/lib/profiles';
+import { isTransientNetworkError } from '@/lib/networkRetry';
 import { COLORS } from '@/constants/colors';
 import { FONTS } from '@/constants/fonts';
+
+const ROLE_RETRY_DELAY_MS = 5000;
 
 export default function TabLayout() {
     const { user, session, loading } = useAuth();
@@ -35,16 +38,36 @@ export default function TabLayout() {
         router.replace('/login');
         return () => { active = false; };
       }
-      getProfileWithError(user.id, session?.access_token).then(({ profile, error }) => {
-        if (!active) return;
-        if (error) console.error('Unable to load the account role for navigation.', error);
-        setRole(profile?.is_active === false ? null : profile?.role ?? null);
-      }).catch((error: unknown) => {
-        if (!active) return;
-        console.error('Unable to load the account role for navigation.', error);
-        setRole(null);
-      });
-      return () => { active = false; };
+      let retryTimer: ReturnType<typeof setTimeout> | undefined;
+      const loadRole = async () => {
+        try {
+          const { profile, error } = await getProfileWithError(user.id, session.access_token);
+          if (!active) return;
+          if (error) {
+            if (!isTransientNetworkError(error)) {
+              console.error('Unable to load the account role for navigation.', error);
+              setRole(null);
+              return;
+            }
+            retryTimer = setTimeout(() => { void loadRole(); }, ROLE_RETRY_DELAY_MS);
+            return;
+          }
+          setRole(profile?.is_active === false ? null : profile?.role ?? null);
+        } catch (error: unknown) {
+          if (!active) return;
+          if (isTransientNetworkError(error)) {
+            retryTimer = setTimeout(() => { void loadRole(); }, ROLE_RETRY_DELAY_MS);
+          } else {
+            console.error('Unable to load the account role for navigation.', error);
+            setRole(null);
+          }
+        }
+      };
+      void loadRole();
+      return () => {
+        active = false;
+        if (retryTimer) clearTimeout(retryTimer);
+      };
     }, [loading, pathname, session?.access_token, user?.id]);
 
   return (

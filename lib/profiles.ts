@@ -1,4 +1,5 @@
 import { getFreshAccessToken, supabase } from './supabase';
+import { retryTransientNetworkRequest } from './networkRetry';
 import type { Session } from '@supabase/supabase-js';
 
 export type Role = 'student' | 'teacher' | 'admin';
@@ -111,24 +112,25 @@ export async function getProfileWithError(
   userId: string,
   accessToken?: string,
 ): Promise<{ profile: Profile | null; error: string | null }> {
-  let token = accessToken;
-  if (token) {
-    const { data, error } = await supabase.auth.getUser(token);
-    if (error) return { profile: null, error: error.message };
-    if (data.user?.id !== userId) {
-      return { profile: null, error: 'The active sign-in session does not match this account. Please sign in again.' };
+  return retryTransientNetworkRequest(async () => {
+    let token = accessToken;
+    if (token) {
+      const { data, error } = await supabase.auth.getUser(token);
+      if (error) return { profile: null, error: error.message };
+      if (data.user?.id !== userId) {
+        return { profile: null, error: 'The active sign-in session does not match this account. Please sign in again.' };
+      }
+    } else {
+      const { data, error } = await supabase.auth.getSession();
+      if (error) return { profile: null, error: error.message };
+      if (data.session?.user.id !== userId) {
+        return { profile: null, error: 'The active sign-in session does not match this account. Please sign in again.' };
+      }
+      token = data.session.access_token;
     }
-  } else {
-    const { data, error } = await supabase.auth.getSession();
-    if (error) return { profile: null, error: error.message };
-    if (data.session?.user.id !== userId) {
-      return { profile: null, error: 'The active sign-in session does not match this account. Please sign in again.' };
-    }
-    token = data.session.access_token;
-  }
 
-  const current = await loadProfileRow(userId, token);
-  return current;
+    return loadProfileRow(userId, token);
+  });
 }
 
 export async function getProfile(userId: string, accessToken?: string): Promise<Profile | null> {

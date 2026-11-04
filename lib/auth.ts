@@ -2,6 +2,7 @@ import { useState, useEffect } from 'react';
 import { AppState, Platform } from 'react-native';
 import * as Linking from 'expo-linking';
 import { setLatestAuthSession, setSessionPersistence, supabase, supabaseSignUpClient } from './supabase';
+import { retryTransientNetworkRequest } from './networkRetry';
 import type { Session, User } from '@supabase/supabase-js';
 
 type AuthState = {
@@ -133,7 +134,9 @@ export async function signUp(
 
 export async function signIn(email: string, password: string, rememberSession = false) {
   await setSessionPersistence(rememberSession);
-  const { data, error } = await supabase.auth.signInWithPassword({ email, password });
+  const { data, error } = await retryTransientNetworkRequest(
+    () => supabase.auth.signInWithPassword({ email, password }),
+  );
   if (!error && data.session) {
     setAuth(data.session);
   }

@@ -18,6 +18,7 @@ import { COLORS } from '@/constants/colors';
 import { FONTS } from '@/constants/fonts';
 import { MOTION } from '@/constants/motion';
 import { useAuth } from '@/lib/auth';
+import { isTransientNetworkError } from '@/lib/networkRetry';
 import { subscribeToSupabaseDataChanges } from '@/lib/supabaseRealtime';
 import { approveTeacher, deleteAdminUser, deactivateAdminUser, getAdminDashboardData, reactivateAdminUser, updateAdminUser, type AdminDashboardData } from '@/lib/admin';
 import { getProfileWithError } from '@/lib/profiles';
@@ -243,8 +244,8 @@ export default function AdminScreen() {
         setDashboard(result.data);
       } catch (error) {
         if (cancelled) return;
-        console.error('Unable to load administrator dashboard.', error);
-        setAuthorized(profileVerified);
+        if (!isTransientNetworkError(error)) console.error('Unable to load administrator dashboard.', error);
+        setAuthorized(profileVerified ? true : null);
         setDashboard(null);
         setError(error instanceof Error ? error.message : 'Unable to load administrator data. Please try again.');
       } finally {
@@ -503,7 +504,11 @@ export default function AdminScreen() {
   };
 
   if (authorized === null) {
-    return <State text="Checking administrator access..." loading />;
+    return <State
+      text={dashboardLoading ? 'Checking administrator access...' : error ?? 'Unable to verify administrator access.'}
+      loading={dashboardLoading}
+      onRetry={!dashboardLoading ? () => setDashboardRetry((attempt) => attempt + 1) : undefined}
+    />;
   }
 
   if (!authorized) {
